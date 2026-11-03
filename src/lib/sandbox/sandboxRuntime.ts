@@ -167,6 +167,89 @@ export function storeSetCookieForUrl(
   }
 }
 
+const CORS_SAFE_DIRECT_HOSTS = [
+  'raw.githubusercontent.com',
+  'gist.githubusercontent.com',
+  'cdn.jsdelivr.net',
+  'himanshu8443.github.io',
+  'imarankhan.github.io',
+  'api.themoviedb.org',
+  'v3-cinemeta.strem.io',
+  'cinemeta-catalogs.strem.io',
+  'v3-channels.strem.io',
+];
+
+function isCorsSafeDirectHost(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    return CORS_SAFE_DIRECT_HOSTS.some(
+      h => host === h || host.endsWith(`.${h}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function responseToProxyResult(
+  res: Response,
+  fallbackUrl: string,
+): Promise<{
+  status: number;
+  statusText: string;
+  url: string;
+  headers: Record<string, string>;
+  bodyBytes: Uint8Array;
+  bodyText: string;
+}> {
+  const responseHeaders: Record<string, string> = {};
+  res.headers.forEach((v, k) => {
+    responseHeaders[k.toLowerCase()] = v;
+  });
+  const ab = await res.arrayBuffer();
+  const bodyBytes = new Uint8Array(ab);
+  const bodyText = new TextDecoder('utf-8').decode(bodyBytes);
+  return {
+    status: res.status,
+    statusText: res.statusText || '',
+    url: res.url || fallbackUrl,
+    headers: responseHeaders,
+    bodyBytes,
+    bodyText,
+  };
+}
+
+function buildBrowserSafeHeaders(
+  headers: Record<string, string>,
+  stripCacheHeaders = false,
+): Record<string, string> {
+  const safe: Record<string, string> = {};
+  const forbiddenPrefixes = ['sec-', 'proxy-'];
+  const forbiddenNames = new Set([
+    'user-agent',
+    'referer',
+    'origin',
+    'cookie',
+    'host',
+    'connection',
+    'content-length',
+    'accept-encoding',
+  ]);
+  if (stripCacheHeaders) {
+    forbiddenNames.add('cache-control');
+    forbiddenNames.add('pragma');
+  }
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (forbiddenNames.has(lower)) continue;
+    if (forbiddenPrefixes.some(p => lower.startsWith(p))) continue;
+    if (v !== undefined && v !== null && String(v).trim() !== '') {
+      safe[k] = String(v);
+    }
+  }
+  return safe;
+}
+
 export async function proxyFetch(
   author: string,
   url: string,
@@ -200,6 +283,25 @@ export async function proxyFetch(
     }
   }
 
+  // 1. Fast path for CORS-enabled public hosts (GitHub Raw, JSDelivr, GitHub Pages, TMDB, Cinemeta)
+  if (method === 'GET' && isCorsSafeDirectHost(url) && !storedCookie) {
+    try {
+      const cleanHeaders = buildBrowserSafeHeaders(headers, true);
+      const directRes = await fetch(url, {
+        method: 'GET',
+        headers:
+          Object.keys(cleanHeaders).length > 0 ? cleanHeaders : undefined,
+        cache: 'no-store',
+        signal: init?.signal,
+      });
+      if (directRes.ok || directRes.status === 404) {
+        return await responseToProxyResult(directRes, url);
+      }
+    } catch {
+      // Fall through to proxy endpoints if direct fetch is blocked
+    }
+  }
+
   let bodyBase64: string | undefined;
   if (init?.body instanceof Uint8Array) {
     bodyBase64 = uint8ToBase64(init.body);
@@ -207,45 +309,116 @@ export async function proxyFetch(
     bodyBase64 = encodeUtf8ToBase64(init.body);
   }
 
-  const res = await fetch('/api/proxy', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      url,
-      method,
-      headers,
-      bodyBase64,
-      redirect: init?.redirect || 'follow',
-    }),
-    signal: init?.signal,
+  const proxyPayload = JSON.stringify({
+    url,
+    method,
+    headers,
+    bodyBase64,
+    redirect: init?.redirect || 'follow',
   });
 
-  if (!res.ok) {
-    const errData = await res.json().catch(() => ({}));
-    throw new Error(errData?.error || `Proxy HTTP ${res.status}`);
+  // 2. Try backend proxy (/api/proxy and /.netlify/functions/proxy)
+  const proxyEndpoints = ['/api/proxy', '/.netlify/functions/proxy'];
+  for (const endpoint of proxyEndpoints) {
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: proxyPayload,
+        signal: init?.signal,
+      });
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data && typeof data.status === 'number') {
+          const responseHeaders: Record<string, string> = data.headers || {};
+          if (responseHeaders['set-cookie']) {
+            storeSetCookieForUrl(
+              author,
+              data.url || url,
+              responseHeaders['set-cookie'],
+            );
+          }
+
+          const bodyBytes = base64ToUint8(data.bodyBase64 || '');
+          const bodyText = decodeBase64ToUtf8(data.bodyBase64 || '');
+
+          return {
+            status: data.status,
+            statusText: data.statusText || '',
+            url: data.url || url,
+            headers: responseHeaders,
+            bodyBytes,
+            bodyText,
+          };
+        }
+      }
+    } catch {
+      // Try next endpoint or fallback
+    }
   }
 
-  const data = await res.json();
-  const responseHeaders: Record<string, string> = data.headers || {};
-  if (responseHeaders['set-cookie']) {
-    storeSetCookieForUrl(
-      author,
-      data.url || url,
-      responseHeaders['set-cookie'],
+  // 3. Fallback A: Direct browser fetch (works when target server sends Access-Control-Allow-Origin)
+  const safeBrowserHeaders = buildBrowserSafeHeaders(headers, true);
+  const directBody: BodyInit | undefined =
+    method !== 'GET' && method !== 'HEAD' && init?.body
+      ? typeof init.body === 'string'
+        ? init.body
+        : (init.body as unknown as BodyInit)
+      : undefined;
+
+  try {
+    const directRes = await fetch(url, {
+      method,
+      headers:
+        Object.keys(safeBrowserHeaders).length > 0
+          ? safeBrowserHeaders
+          : undefined,
+      body: directBody,
+      cache: 'no-store',
+      signal: init?.signal,
+    });
+    return await responseToProxyResult(directRes, url);
+  } catch {
+    // Target blocked direct browser CORS; continue to public CORS proxies
+  }
+
+  // 4. Fallback B: Public CORS Proxies for static hosting environments
+  const publicCorsProxies: string[] = [
+    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  ];
+  if (method === 'GET') {
+    publicCorsProxies.push(
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
     );
   }
 
-  const bodyBytes = base64ToUint8(data.bodyBase64 || '');
-  const bodyText = decodeBase64ToUtf8(data.bodyBase64 || '');
+  let lastError: Error | null = null;
+  for (const corsProxyUrl of publicCorsProxies) {
+    try {
+      const corsRes = await fetch(corsProxyUrl, {
+        method,
+        headers:
+          Object.keys(safeBrowserHeaders).length > 0
+            ? safeBrowserHeaders
+            : undefined,
+        body: directBody,
+        signal: init?.signal,
+      });
+      if (corsRes.ok || (corsRes.status >= 200 && corsRes.status < 500)) {
+        return await responseToProxyResult(corsRes, url);
+      }
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
 
-  return {
-    status: data.status,
-    statusText: data.statusText || '',
-    url: data.url || url,
-    headers: responseHeaders,
-    bodyBytes,
-    bodyText,
-  };
+  throw (
+    lastError ||
+    new Error(`Failed to fetch ${url} via proxy and CORS fallbacks`)
+  );
 }
 
 function createProviderFetchFunction(author: string) {
@@ -482,6 +655,91 @@ function createScopedKvStore(
   };
 }
 
+function computeMd5Bytes(message: Uint8Array): Uint8Array {
+  const s = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) {
+    K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  }
+
+  const origLenBits = message.length * 8;
+  const withOne = message.length + 1;
+  const padLen = (56 - (withOne % 64) + 64) % 64;
+  const totalLen = withOne + padLen + 8;
+  const padded = new Uint8Array(totalLen);
+  padded.set(message);
+  padded[message.length] = 0x80;
+
+  const view = new DataView(padded.buffer);
+  view.setUint32(totalLen - 8, origLenBits >>> 0, true);
+  view.setUint32(totalLen - 4, Math.floor(origLenBits / 0x100000000) >>> 0, true);
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+
+  for (let offset = 0; offset < totalLen; offset += 64) {
+    const M = new Uint32Array(16);
+    for (let j = 0; j < 16; j++) {
+      M[j] = view.getUint32(offset + j * 4, true);
+    }
+
+    let A = a0;
+    let B = b0;
+    let C = c0;
+    let D = d0;
+
+    for (let i = 0; i < 64; i++) {
+      let F = 0;
+      let g = 0;
+      if (i < 16) {
+        F = (B & C) | (~B & D);
+        g = i;
+      } else if (i < 32) {
+        F = (D & B) | (~D & C);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        F = B ^ C ^ D;
+        g = (3 * i + 5) % 16;
+      } else {
+        F = C ^ (B | ~D);
+        g = (7 * i) % 16;
+      }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D;
+      D = C;
+      C = B;
+      const rotated = ((F << s[i]) | (F >>> (32 - s[i]))) >>> 0;
+      B = (B + rotated) >>> 0;
+    }
+
+    a0 = (a0 + A) >>> 0;
+    b0 = (b0 + B) >>> 0;
+    c0 = (c0 + C) >>> 0;
+    d0 = (d0 + D) >>> 0;
+  }
+
+  const out = new Uint8Array(16);
+  const outView = new DataView(out.buffer);
+  outView.setUint32(0, a0, true);
+  outView.setUint32(4, b0, true);
+  outView.setUint32(8, c0, true);
+  outView.setUint32(12, d0, true);
+  return out;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 const cryptoShim: ProviderContext['Crypto'] = {
   CryptoDigestAlgorithm: {
     MD5: 'MD5',
@@ -497,16 +755,29 @@ const cryptoShim: ProviderContext['Crypto'] = {
   digestStringAsync: async (algorithm, data, options) => {
     const encoding =
       options?.encoding?.toLowerCase() === 'base64' ? 'base64' : 'hex';
-    const res = await fetch('/api/crypto/digest', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({algorithm, data, encoding}),
-    });
-    if (!res.ok) {
-      throw new Error('Failed to compute crypto digest');
+    const normalized = String(algorithm || 'SHA-256')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+    const inputBytes = new TextEncoder().encode(String(data ?? ''));
+
+    let digestBytes: Uint8Array;
+    if (normalized === 'MD5') {
+      digestBytes = computeMd5Bytes(inputBytes);
+    } else {
+      const subtleAlgoMap: Record<string, string> = {
+        SHA1: 'SHA-1',
+        SHA256: 'SHA-256',
+        SHA384: 'SHA-384',
+        SHA512: 'SHA-512',
+      };
+      const subtleAlgo = subtleAlgoMap[normalized] || 'SHA-256';
+      const buf = await window.crypto.subtle.digest(subtleAlgo, inputBytes);
+      digestBytes = new Uint8Array(buf);
     }
-    const json = await res.json();
-    return json.digest;
+
+    return encoding === 'base64'
+      ? uint8ToBase64(digestBytes)
+      : bytesToHex(digestBytes);
   },
   getRandomBytesAsync: async byteCount => {
     const count = Math.max(0, Math.min(65536, Math.floor(byteCount)));

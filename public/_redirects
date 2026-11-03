@@ -1,0 +1,5 @@
+/api/proxy /.netlify/functions/proxy 200
+/api/base-url /.netlify/functions/base-url 200
+/api/crypto/digest /.netlify/functions/crypto-digest 200
+/api/stream-proxy /.netlify/functions/stream-proxy 200
+/* /index.html 200

@@ -188,6 +188,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
 
   // Decoder & Transcode state
   const [decoderMode, setDecoderMode] = useState<DecoderMode>('hw');
+  const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
+    null,
+  );
+  const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
   const [probedSubTracks, setProbedSubTracks] = useState<SubtitleTrackItem[]>([]);
   const [probedResolution, setProbedResolution] = useState<string>('');
@@ -267,9 +271,22 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   }, [selectedStream?.link]);
 
   const isUsingTranscodeEngine = useMemo(() => {
-    if (isLocalBlob || isHlsStream || !selectedStream?.link) return false;
+    if (
+      isLocalBlob ||
+      isHlsStream ||
+      !selectedStream?.link ||
+      transcodeAvailable === false
+    ) {
+      return false;
+    }
     return decoderMode === 'hw' || decoderMode === 'sw';
-  }, [isLocalBlob, isHlsStream, selectedStream?.link, decoderMode]);
+  }, [
+    isLocalBlob,
+    isHlsStream,
+    selectedStream?.link,
+    decoderMode,
+    transcodeAvailable,
+  ]);
 
   const currentTime = isUsingTranscodeEngine
     ? transcodeOffset + rawVideoTime
@@ -300,6 +317,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setProbedSubTracks([]);
     setProbedResolution('');
     setSelectedAudioTrackId(0);
+    setUseRawUrlFallback(false);
 
     // Check saved resume position
     const savedResumePos =
@@ -316,9 +334,18 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       rawLink.toLowerCase().includes('hubcdn') ||
       rawLink.toLowerCase().includes('workers.dev');
 
-    const initialMode: DecoderMode = isMkvOrContainer ? 'hw' : 'direct';
+    const initialMode: DecoderMode =
+      transcodeAvailable === false
+        ? 'direct'
+        : isMkvOrContainer
+          ? 'hw'
+          : 'direct';
     setDecoderMode(initialMode);
-    setTranscodeOffset(initialMode !== 'direct' && savedResumePos > 5 ? Math.floor(savedResumePos) : 0);
+    setTranscodeOffset(
+      initialMode !== 'direct' && savedResumePos > 5
+        ? Math.floor(savedResumePos)
+        : 0,
+    );
 
     if (!rawLink || rawLink.startsWith('blob:')) return;
 
@@ -329,9 +356,16 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     }
 
     fetch(`/api/probe-stream?${params.toString()}`)
-      .then(r => r.json())
+      .then(async r => {
+        const ct = (r.headers.get('content-type') || '').toLowerCase();
+        if (!r.ok || !ct.includes('application/json')) {
+          throw new Error('Probe endpoint unavailable');
+        }
+        return r.json();
+      })
       .then(info => {
         if (cancelled || !info) return;
+        setTranscodeAvailable(true);
         if (typeof info.duration === 'number' && info.duration > 0) {
           setProbedDuration(info.duration);
         }
@@ -388,7 +422,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           setDecoderMode(prev => (prev === 'direct' ? (isHevc ? 'sw' : 'hw') : prev));
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (cancelled) return;
+        setTranscodeAvailable(false);
+        setDecoderMode('direct');
+        setTranscodeOffset(0);
+      });
 
     return () => {
       cancelled = true;
@@ -419,7 +458,24 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       return rawLink;
     }
 
-    if (isHlsStream || decoderMode === 'direct') {
+    if (useRawUrlFallback) {
+      return rawLink;
+    }
+
+    // On serverless/static hosts (transcodeAvailable === false), stream large MP4/MKV containers directly from CDN
+    if (
+      transcodeAvailable === false &&
+      !isHlsStream &&
+      !encodedStreamHeaders
+    ) {
+      return rawLink;
+    }
+
+    if (
+      isHlsStream ||
+      decoderMode === 'direct' ||
+      transcodeAvailable === false
+    ) {
       const params = new URLSearchParams({url: rawLink});
       if (encodedStreamHeaders) {
         params.set('headers', encodedStreamHeaders);
@@ -442,6 +498,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     selectedStream?.link,
     isHlsStream,
     decoderMode,
+    transcodeAvailable,
+    useRawUrlFallback,
     transcodeOffset,
     selectedAudioTrackId,
     encodedStreamHeaders,
@@ -1017,17 +1075,41 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           }
         }}
         onError={() => {
-          // Automatic decoder fallback: Direct -> HW Remux -> SW Transcode -> Next Server
-          if (decoderMode === 'direct' && !isLocalBlob && !isHlsStream) {
+          // Automatic decoder fallback:
+          // 1. If in 'direct' and transcode is available, try HW Remux -> SW Transcode
+          // 2. If in 'hw' or 'sw' and transcode fails, fall back to 'direct' + raw URL
+          // 3. If in 'direct' via /api/stream-proxy and it fails, try raw direct URL before switching servers
+          if (
+            decoderMode === 'direct' &&
+            transcodeAvailable === true &&
+            !isLocalBlob &&
+            !isHlsStream
+          ) {
             setTranscodeOffset(Math.floor(currentTime));
             setDecoderMode('hw');
             showToast('Switching to HW Remux Decoder...');
             return;
           }
-          if (decoderMode === 'hw' && !isLocalBlob && !isHlsStream) {
+          if (
+            decoderMode === 'hw' &&
+            transcodeAvailable === true &&
+            !isLocalBlob &&
+            !isHlsStream
+          ) {
             setTranscodeOffset(Math.floor(currentTime));
             setDecoderMode('sw');
             showToast('Switching to SW H.264 Decoder...');
+            return;
+          }
+          if (decoderMode !== 'direct') {
+            setTranscodeOffset(0);
+            setDecoderMode('direct');
+            setUseRawUrlFallback(true);
+            showToast('Switching to Direct Stream...');
+            return;
+          }
+          if (!useRawUrlFallback && !isLocalBlob) {
+            setUseRawUrlFallback(true);
             return;
           }
           const switched = switchToNextStream();

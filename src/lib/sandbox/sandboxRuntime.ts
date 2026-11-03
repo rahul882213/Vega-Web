@@ -317,8 +317,22 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy and /.netlify/functions/proxy)
-  const proxyEndpoints = ['/api/proxy', '/.netlify/functions/proxy'];
+  // 2. Try backend proxy (/api/proxy, /.netlify/functions/proxy, and Asia-East Cloud Run relay)
+  const proxyEndpoints = [
+    '/api/proxy',
+    '/.netlify/functions/proxy',
+    'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app/api/proxy',
+  ];
+
+  let blockedResult: {
+    status: number;
+    statusText: string;
+    url: string;
+    headers: Record<string, string>;
+    bodyBytes: Uint8Array;
+    bodyText: string;
+  } | null = null;
+
   for (const endpoint of proxyEndpoints) {
     try {
       const res = await fetch(endpoint, {
@@ -344,7 +358,7 @@ export async function proxyFetch(
           const bodyBytes = base64ToUint8(data.bodyBase64 || '');
           const bodyText = decodeBase64ToUtf8(data.bodyBase64 || '');
 
-          return {
+          const parsedResult = {
             status: data.status,
             statusText: data.statusText || '',
             url: data.url || url,
@@ -352,11 +366,27 @@ export async function proxyFetch(
             bodyBytes,
             bodyText,
           };
+
+          // If Cloudflare/WAF returned 403, 429, or 503 on this proxy node, try the next proxy region
+          if (
+            data.status === 403 ||
+            data.status === 429 ||
+            data.status === 503
+          ) {
+            blockedResult = parsedResult;
+            continue;
+          }
+
+          return parsedResult;
         }
       }
     } catch {
       // Try next endpoint or fallback
     }
+  }
+
+  if (blockedResult) {
+    return blockedResult;
   }
 
   // 3. Fallback A: Direct browser fetch (works when target server sends Access-Control-Allow-Origin)

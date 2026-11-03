@@ -71,6 +71,9 @@ type SleepOption = 'off' | 'episode' | number;
 
 const SLEEP_PRESETS: SleepOption[] = ['off', 15, 30, 45, 60, 90, 'episode'];
 
+const REMOTE_STREAM_BACKEND =
+  'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app';
+
 const LANGUAGE_NAMES: Record<string, string> = {
   en: 'English',
   eng: 'English',
@@ -191,6 +194,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
     null,
   );
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
+  const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(false);
   const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
   const [probedSubTracks, setProbedSubTracks] = useState<SubtitleTrackItem[]>([]);
@@ -317,6 +322,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setProbedSubTracks([]);
     setProbedResolution('');
     setSelectedAudioTrackId(0);
+    setUseRemoteProxyFallback(
+      typeof window !== 'undefined' &&
+        window.location.hostname.endsWith('github.io'),
+    );
     setUseRawUrlFallback(false);
 
     // Check saved resume position
@@ -355,16 +364,29 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       params.set('headers', encodedStreamHeaders);
     }
 
-    fetch(`/api/probe-stream?${params.toString()}`)
-      .then(async r => {
-        const ct = (r.headers.get('content-type') || '').toLowerCase();
-        if (!r.ok || !ct.includes('application/json')) {
-          throw new Error('Probe endpoint unavailable');
+    const probeStreamWithFallback = async () => {
+      const candidates = ['', REMOTE_STREAM_BACKEND];
+      for (const base of candidates) {
+        try {
+          const r = await fetch(`${base}/api/probe-stream?${params.toString()}`);
+          const ct = (r.headers.get('content-type') || '').toLowerCase();
+          if (r.ok && ct.includes('application/json')) {
+            const info = await r.json();
+            if (info && !info.error) {
+              return {base, info};
+            }
+          }
+        } catch {
+          // Try next probe base
         }
-        return r.json();
-      })
-      .then(info => {
+      }
+      throw new Error('Probe endpoint unavailable');
+    };
+
+    probeStreamWithFallback()
+      .then(({base, info}) => {
         if (cancelled || !info) return;
+        setApiBaseUrl(base);
         setTranscodeAvailable(true);
         if (typeof info.duration === 'number' && info.duration > 0) {
           setProbedDuration(info.duration);
@@ -406,7 +428,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                   .filter(Boolean)
                   .join(' · '),
                 language: s.language || 'en',
-                uri: `/api/subtitle-extract?${subParams.toString()}`,
+                uri: `${base}/api/subtitle-extract?${subParams.toString()}`,
               };
             }),
           );
@@ -458,11 +480,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       return rawLink;
     }
 
-    if (useRawUrlFallback) {
+    // Only use raw URL fallback when stream does NOT require custom Referer/Origin headers
+    if (useRawUrlFallback && !encodedStreamHeaders) {
       return rawLink;
     }
 
-    // On serverless/static hosts (transcodeAvailable === false), stream large MP4/MKV containers directly from CDN
+    // On serverless/static hosts (transcodeAvailable === false), stream large MP4/MKV containers directly from CDN ONLY when no custom headers are required
     if (
       transcodeAvailable === false &&
       !isHlsStream &&
@@ -470,6 +493,14 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     ) {
       return rawLink;
     }
+
+    const proxyBase = useRemoteProxyFallback
+      ? REMOTE_STREAM_BACKEND
+      : apiBaseUrl &&
+          typeof window !== 'undefined' &&
+          window.location.hostname.endsWith('github.io')
+        ? apiBaseUrl
+        : '';
 
     if (
       isHlsStream ||
@@ -480,10 +511,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       if (encodedStreamHeaders) {
         params.set('headers', encodedStreamHeaders);
       }
-      return `/api/stream-proxy?${params.toString()}`;
+      return `${proxyBase}/api/stream-proxy?${params.toString()}`;
     }
 
     // Live FFmpeg Remux ('hw') or Software Transcode ('sw')
+    const transcodeBase = apiBaseUrl || '';
     const params = new URLSearchParams({
       url: rawLink,
       start: String(Math.floor(transcodeOffset)),
@@ -493,12 +525,14 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     if (encodedStreamHeaders) {
       params.set('headers', encodedStreamHeaders);
     }
-    return `/api/transcode-stream?${params.toString()}`;
+    return `${transcodeBase}/api/transcode-stream?${params.toString()}`;
   }, [
     selectedStream?.link,
     isHlsStream,
     decoderMode,
     transcodeAvailable,
+    apiBaseUrl,
+    useRemoteProxyFallback,
     useRawUrlFallback,
     transcodeOffset,
     selectedAudioTrackId,
@@ -593,6 +627,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         if (data.fatal) {
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             hls.recoverMediaError();
+          } else if (!useRemoteProxyFallback) {
+            setUseRemoteProxyFallback(true);
           } else {
             const switched = switchToNextStream();
             if (!switched) {
@@ -644,18 +680,43 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       }
 
       try {
-        let subUrl = track.uri;
-        if (!subUrl.startsWith('blob:') && !subUrl.startsWith('/api/')) {
-          subUrl = `/api/stream-proxy?url=${encodeURIComponent(track.uri)}`;
-        } else if (subUrl.startsWith('/api/subtitle-extract') && isUsingTranscodeEngine && transcodeOffset > 0) {
-          subUrl = `${subUrl}&start=${Math.floor(transcodeOffset)}`;
+        let subText = '';
+        if (track.uri.startsWith('blob:')) {
+          const res = await fetch(track.uri);
+          subText = await res.text();
+        } else if (track.uri.includes('/api/subtitle-extract')) {
+          let extractUrl = track.uri;
+          if (isUsingTranscodeEngine && transcodeOffset > 0) {
+            extractUrl = `${extractUrl}&start=${Math.floor(transcodeOffset)}`;
+          }
+          const res = await fetch(extractUrl);
+          subText = await res.text();
+        } else {
+          const subParams = new URLSearchParams({url: track.uri});
+          if (encodedStreamHeaders) {
+            subParams.set('headers', encodedStreamHeaders);
+          }
+          const bases = ['', REMOTE_STREAM_BACKEND];
+          for (const base of bases) {
+            try {
+              const res = await fetch(
+                `${base}/api/stream-proxy?${subParams.toString()}`,
+              );
+              if (res.ok) {
+                subText = await res.text();
+                if (subText && !subText.trimStart().startsWith('<!doctype')) {
+                  break;
+                }
+              }
+            } catch {
+              // Try next base
+            }
+          }
         }
-        const res = await fetch(subUrl);
-        const text = await res.text();
-        if (!active) return;
-        const vtt = text.trimStart().startsWith('WEBVTT')
-          ? text
-          : convertSrtToVtt(text);
+        if (!active || !subText) return;
+        const vtt = subText.trimStart().startsWith('WEBVTT')
+          ? subText
+          : convertSrtToVtt(subText);
         const blob = new Blob([vtt], {type: 'text/vtt'});
         createdBlob = URL.createObjectURL(blob);
         setActiveVttBlobUrl(createdBlob);
@@ -669,7 +730,13 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       active = false;
       if (createdBlob) URL.revokeObjectURL(createdBlob);
     };
-  }, [selectedSubtitleId, subtitleTracks, isUsingTranscodeEngine, transcodeOffset]);
+  }, [
+    selectedSubtitleId,
+    subtitleTracks,
+    isUsingTranscodeEngine,
+    transcodeOffset,
+    encodedStreamHeaders,
+  ]);
 
   // Auto-hide controls after 3.5s of inactivity
   useEffect(() => {
@@ -1075,10 +1142,19 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           }
         }}
         onError={() => {
-          // Automatic decoder fallback:
-          // 1. If in 'direct' and transcode is available, try HW Remux -> SW Transcode
-          // 2. If in 'hw' or 'sw' and transcode fails, fall back to 'direct' + raw URL
-          // 3. If in 'direct' via /api/stream-proxy and it fails, try raw direct URL before switching servers
+          // Automatic decoder & proxy fallback chain:
+          // 1. If in 'direct' via local /api/stream-proxy and it fails, try remote stream proxy (REMOTE_STREAM_BACKEND)
+          // 2. If in 'direct' and transcode is available, try HW Remux -> SW Transcode
+          // 3. If in 'hw' or 'sw' and transcode fails, fall back to 'direct'
+          // 4. If no custom headers are required, try raw direct URL before switching servers
+          if (
+            decoderMode === 'direct' &&
+            !useRemoteProxyFallback &&
+            !isLocalBlob
+          ) {
+            setUseRemoteProxyFallback(true);
+            return;
+          }
           if (
             decoderMode === 'direct' &&
             transcodeAvailable === true &&
@@ -1104,11 +1180,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           if (decoderMode !== 'direct') {
             setTranscodeOffset(0);
             setDecoderMode('direct');
-            setUseRawUrlFallback(true);
+            setUseRemoteProxyFallback(true);
             showToast('Switching to Direct Stream...');
             return;
           }
-          if (!useRawUrlFallback && !isLocalBlob) {
+          if (!useRawUrlFallback && !encodedStreamHeaders && !isLocalBlob) {
             setUseRawUrlFallback(true);
             return;
           }

@@ -9,6 +9,9 @@ const httpsAgent = new https.Agent({
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// 3.5 MB chunk size so base64-encoded body (~4.67 MB) stays safely under Netlify's 6 MB Lambda response limit
+const MAX_RANGE_CHUNK_BYTES = 3584 * 1024;
+
 function parseEncodedHeaders(encodedHeaders) {
   const customHeaders = {};
   if (!encodedHeaders) return customHeaders;
@@ -26,6 +29,22 @@ function parseEncodedHeaders(encodedHeaders) {
     // Ignore malformed base64 headers
   }
   return customHeaders;
+}
+
+function clampRangeHeader(rangeHeader, maxChunk = MAX_RANGE_CHUNK_BYTES) {
+  if (!rangeHeader || !rangeHeader.startsWith('bytes=')) {
+    return `bytes=0-${maxChunk - 1}`;
+  }
+  const match = /^bytes=(\d+)-(\d*)$/i.exec(rangeHeader.trim());
+  if (!match) {
+    return `bytes=0-${maxChunk - 1}`;
+  }
+  const start = parseInt(match[1], 10) || 0;
+  const requestedEnd = match[2] ? parseInt(match[2], 10) : NaN;
+  const clampedEnd = Number.isFinite(requestedEnd)
+    ? Math.min(requestedEnd, start + maxChunk - 1)
+    : start + maxChunk - 1;
+  return `bytes=${start}-${clampedEnd}`;
 }
 
 function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders) {
@@ -66,6 +85,8 @@ export async function handler(event) {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
         'Access-Control-Allow-Headers': '*',
+        'Access-Control-Expose-Headers':
+          'Content-Length, Content-Range, Accept-Ranges, Content-Type',
       },
       body: '',
     };
@@ -97,61 +118,26 @@ export async function handler(event) {
       outgoingHeaders[k] = v;
     }
 
-    const incomingRange =
-      event.headers?.range || event.headers?.Range || undefined;
-    if (incomingRange) {
-      outgoingHeaders['Range'] = incomingRange;
-    }
-
-    // First check if this is a non-HLS direct container file (> 4MB) by doing a fast HEAD/small check or checking extension
     const lowerUrlPath = targetUrl.split('?')[0].toLowerCase();
     const isLikelyM3u8 =
       lowerUrlPath.endsWith('.m3u8') ||
-      targetUrl.toLowerCase().includes('m3u8');
-    const isSegmentOrSub =
+      targetUrl.toLowerCase().includes('.m3u8');
+    const isTextSubtitle =
+      lowerUrlPath.endsWith('.vtt') || lowerUrlPath.endsWith('.srt');
+    const isHlsSegment =
       lowerUrlPath.endsWith('.ts') ||
       lowerUrlPath.endsWith('.m4s') ||
-      lowerUrlPath.endsWith('.vtt') ||
-      lowerUrlPath.endsWith('.srt') ||
       lowerUrlPath.endsWith('.key');
 
-    // If it's a large container video (MP4/MKV) on Netlify Serverless (which has a 6MB response cap),
-    // resolve any redirects and issue a 302 redirect to the final signed CDN URL
-    if (!isLikelyM3u8 && !isSegmentOrSub) {
-      try {
-        const headRes = await axios.head(targetUrl, {
-          headers: outgoingHeaders,
-          maxRedirects: 8,
-          validateStatus: () => true,
-          timeout: 10000,
-          httpsAgent,
-        });
-        const finalUrl =
-          headRes.request?.res?.responseUrl ||
-          headRes.config?.url ||
-          targetUrl;
-        const ct = String(headRes.headers['content-type'] || '').toLowerCase();
-        const cl = Number(headRes.headers['content-length'] || 0);
-        if (
-          !ct.includes('mpegurl') &&
-          (cl > 4.5 * 1024 * 1024 ||
-            ct.includes('video/') ||
-            ct.includes('matroska') ||
-            ct.includes('octet-stream'))
-        ) {
-          return {
-            statusCode: 302,
-            headers: {
-              Location: finalUrl,
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache',
-            },
-            body: '',
-          };
-        }
-      } catch {
-        // Continue to standard fetch
-      }
+    const incomingRange =
+      event.headers?.range || event.headers?.Range || undefined;
+
+    // For direct MP4/MKV streams (such as MovieBox Web), clamp each HTTP Range request to 3.5 MB
+    // so Netlify Functions never exceed the 6 MB response cap while keeping custom Referer/Origin headers intact
+    if (!isLikelyM3u8 && !isTextSubtitle && !isHlsSegment) {
+      outgoingHeaders['Range'] = clampRangeHeader(incomingRange);
+    } else if (incomingRange) {
+      outgoingHeaders['Range'] = incomingRange;
     }
 
     const upstream = await axios.get(targetUrl, {
@@ -199,14 +185,44 @@ export async function handler(event) {
       }
     }
 
+    const responseHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Expose-Headers':
+        'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+      'Accept-Ranges': 'bytes',
+      'Content-Length': String(rawBuffer.length),
+    };
+
+    if (upstream.headers['content-range']) {
+      responseHeaders['Content-Range'] = String(
+        upstream.headers['content-range'],
+      );
+    }
+    if (upstream.headers['etag']) {
+      responseHeaders['ETag'] = String(upstream.headers['etag']);
+    }
+    if (upstream.headers['last-modified']) {
+      responseHeaders['Last-Modified'] = String(
+        upstream.headers['last-modified'],
+      );
+    }
+
+    if (
+      !contentType ||
+      contentType.includes('octet-stream') ||
+      contentType.includes('matroska') ||
+      contentType.includes('mkv')
+    ) {
+      responseHeaders['Content-Type'] = 'video/mp4';
+    } else {
+      responseHeaders['Content-Type'] = String(
+        upstream.headers['content-type'],
+      );
+    }
+
     return {
       statusCode: upstream.status,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Content-Type':
-          upstream.headers['content-type'] || 'application/octet-stream',
-        'Cache-Control': upstream.headers['cache-control'] || 'public, max-age=3600',
-      },
+      headers: responseHeaders,
       body: rawBuffer.toString('base64'),
       isBase64Encoded: true,
     };

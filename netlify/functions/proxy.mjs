@@ -9,6 +9,9 @@ const httpsAgent = new https.Agent({
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const FALLBACK_ASIA_PROXY =
+  'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app/api/proxy';
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, HEAD, OPTIONS',
@@ -45,8 +48,14 @@ export async function handler(event) {
 
     const outgoingHeaders = {
       'User-Agent': DEFAULT_USER_AGENT,
-      Accept: '*/*',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Ch-Ua':
+        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Upgrade-Insecure-Requests': '1',
     };
 
     if (headers && typeof headers === 'object') {
@@ -79,9 +88,38 @@ export async function handler(event) {
       responseType: 'arraybuffer',
       maxRedirects: redirect === 'manual' ? 0 : 8,
       validateStatus: () => true,
-      timeout: 25000,
+      timeout: 22000,
       httpsAgent,
     });
+
+    // If Cloudflare/WAF blocks AWS US-East datacenter IP (403 / 503), relay through the Asia-East Cloud Run proxy
+    if (
+      response.status === 403 ||
+      response.status === 503 ||
+      response.status === 429
+    ) {
+      try {
+        const fbRes = await axios.post(FALLBACK_ASIA_PROXY, payload, {
+          headers: {'Content-Type': 'application/json'},
+          timeout: 20000,
+          validateStatus: () => true,
+        });
+        if (
+          fbRes.status === 200 &&
+          fbRes.data &&
+          typeof fbRes.data.status === 'number' &&
+          fbRes.data.status < 400
+        ) {
+          return {
+            statusCode: 200,
+            headers: CORS_HEADERS,
+            body: JSON.stringify(fbRes.data),
+          };
+        }
+      } catch {
+        // Return original response if fallback is unreachable
+      }
+    }
 
     const responseHeaders = {};
     for (const [key, val] of Object.entries(response.headers || {})) {
@@ -115,6 +153,28 @@ export async function handler(event) {
       }),
     };
   } catch (error) {
+    // Fallback to Asia-East Cloud Run proxy on network error
+    try {
+      const fbRes = await axios.post(
+        FALLBACK_ASIA_PROXY,
+        event.body ? JSON.parse(event.body) : {},
+        {
+          headers: {'Content-Type': 'application/json'},
+          timeout: 20000,
+          validateStatus: () => true,
+        },
+      );
+      if (fbRes.status === 200 && fbRes.data) {
+        return {
+          statusCode: 200,
+          headers: CORS_HEADERS,
+          body: JSON.stringify(fbRes.data),
+        };
+      }
+    } catch {
+      // Ignore fallback error
+    }
+
     return {
       statusCode: 502,
       headers: CORS_HEADERS,

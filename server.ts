@@ -1107,8 +1107,8 @@ async function startServer() {
                   );
                 }
 
-                // Enable GitHub Pages on gh-pages branch
-                const pagesRes = await axios.post(
+                // Enable or update GitHub Pages on gh-pages branch
+                let pagesRes = await axios.post(
                   `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/pages`,
                   {
                     source: {
@@ -1118,9 +1118,25 @@ async function startServer() {
                   },
                   {headers: ghHeaders, validateStatus: () => true},
                 );
+                if (pagesRes.status === 409 || pagesRes.status === 422) {
+                  await axios.put(
+                    `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/pages`,
+                    {
+                      source: {
+                        branch: 'gh-pages',
+                        path: '/',
+                      },
+                    },
+                    {headers: ghHeaders, validateStatus: () => true},
+                  );
+                  pagesRes = await axios.get(
+                    `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/pages`,
+                    {headers: ghHeaders, validateStatus: () => true},
+                  );
+                }
                 if (
                   pagesRes.status === 201 ||
-                  pagesRes.status === 409 ||
+                  pagesRes.status === 204 ||
                   pagesRes.status === 200
                 ) {
                   pagesEnabled = true;

@@ -1002,10 +1002,146 @@ async function startServer() {
         return;
       }
 
+      // 7. Also publish built dist/ to gh-pages branch and enable GitHub Pages
+      let pagesUrl = `https://${authedLogin}.github.io/${sanitizedRepo}/`;
+      let pagesEnabled = false;
+      try {
+        const distDir = path.join(__dirname, 'dist');
+        if (fs.existsSync(distDir)) {
+          const distFiles: Array<{path: string; contentBase64: string}> = [];
+          const walkDist = (dir: string, rel = '') => {
+            const entries = fs.readdirSync(dir, {withFileTypes: true});
+            for (const entry of entries) {
+              const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+              if (relPath.startsWith('assets/aistudio')) continue;
+              const fullPath = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                walkDist(fullPath, relPath);
+              } else if (entry.isFile()) {
+                const buf = fs.readFileSync(fullPath);
+                distFiles.push({
+                  path: relPath,
+                  contentBase64: buf.toString('base64'),
+                });
+              }
+            }
+          };
+          walkDist(distDir);
+
+          // Add .nojekyll and 404.html (copy of index.html for SPA routing)
+          distFiles.push({
+            path: '.nojekyll',
+            contentBase64: Buffer.from('', 'utf8').toString('base64'),
+          });
+          const indexHtmlPath = path.join(distDir, 'index.html');
+          if (fs.existsSync(indexHtmlPath)) {
+            distFiles.push({
+              path: '404.html',
+              contentBase64: fs.readFileSync(indexHtmlPath).toString('base64'),
+            });
+          }
+
+          const ghPagesTreeItems: Array<{
+            path: string;
+            mode: '100644';
+            type: 'blob';
+            sha: string;
+          }> = [];
+
+          for (const df of distFiles) {
+            const bRes = await axios.post(
+              `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/blobs`,
+              {
+                content: df.contentBase64,
+                encoding: 'base64',
+              },
+              {headers: ghHeaders, validateStatus: () => true},
+            );
+            if (bRes.status === 201 && bRes.data?.sha) {
+              ghPagesTreeItems.push({
+                path: df.path,
+                mode: '100644',
+                type: 'blob',
+                sha: bRes.data.sha,
+              });
+            }
+          }
+
+          if (ghPagesTreeItems.length > 0) {
+            const gpTreeRes = await axios.post(
+              `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/trees`,
+              {tree: ghPagesTreeItems},
+              {headers: ghHeaders, validateStatus: () => true},
+            );
+
+            if (gpTreeRes.status === 201 && gpTreeRes.data?.sha) {
+              const gpCommitRes = await axios.post(
+                `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/commits`,
+                {
+                  message: 'deploy: Vega Web static build for GitHub Pages',
+                  tree: gpTreeRes.data.sha,
+                  parents: [commitRes.data.sha],
+                },
+                {headers: ghHeaders, validateStatus: () => true},
+              );
+
+              if (gpCommitRes.status === 201 && gpCommitRes.data?.sha) {
+                const gpRefCheck = await axios.get(
+                  `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/ref/heads/gh-pages`,
+                  {headers: ghHeaders, validateStatus: () => true},
+                );
+                if (gpRefCheck.status === 200) {
+                  await axios.patch(
+                    `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/refs/heads/gh-pages`,
+                    {sha: gpCommitRes.data.sha, force: true},
+                    {headers: ghHeaders, validateStatus: () => true},
+                  );
+                } else {
+                  await axios.post(
+                    `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/git/refs`,
+                    {
+                      ref: 'refs/heads/gh-pages',
+                      sha: gpCommitRes.data.sha,
+                    },
+                    {headers: ghHeaders, validateStatus: () => true},
+                  );
+                }
+
+                // Enable GitHub Pages on gh-pages branch
+                const pagesRes = await axios.post(
+                  `https://api.github.com/repos/${authedLogin}/${sanitizedRepo}/pages`,
+                  {
+                    source: {
+                      branch: 'gh-pages',
+                      path: '/',
+                    },
+                  },
+                  {headers: ghHeaders, validateStatus: () => true},
+                );
+                if (
+                  pagesRes.status === 201 ||
+                  pagesRes.status === 409 ||
+                  pagesRes.status === 200
+                ) {
+                  pagesEnabled = true;
+                  if (pagesRes.data?.html_url) {
+                    pagesUrl = pagesRes.data.html_url;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (gpErr) {
+        console.warn('GitHub Pages auto-setup warning:', gpErr);
+      }
+
       const htmlUrl = `https://github.com/${authedLogin}/${sanitizedRepo}`;
       res.json({
         success: true,
         repoUrl: htmlUrl,
+        pagesUrl,
+        pagesEnabled,
         owner: authedLogin,
         repo: sanitizedRepo,
         filesPushed: treeItems.length,

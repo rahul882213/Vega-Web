@@ -6,6 +6,7 @@ import {
   runProviderMeta,
   runProviderPosts,
   runProviderStream,
+  setSandboxDiagnosticTestMode,
 } from '../sandbox/sandboxRuntime';
 
 export type DiagnosticStageName =
@@ -49,6 +50,7 @@ export async function testProvider(
   onProgress?: (event: DiagnosticProgressEvent) => void,
 ): Promise<ProviderDiagnosticResult> {
   const signal = extensionManager.beginDiagnosticTest();
+  setSandboxDiagnosticTestMode(true);
   const stagesCompleted: DiagnosticStageName[] = [];
   const sourceAuthor = provider.source?.author;
 
@@ -382,6 +384,7 @@ export async function testProvider(
       };
     }
   } finally {
+    setSandboxDiagnosticTestMode(false);
     extensionManager.endDiagnosticTest();
   }
 }

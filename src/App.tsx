@@ -5,6 +5,7 @@ import {NavigationProvider, useVegaNavigation} from './NavigationContext';
 import {StreamingTabBar} from './components/StreamingTabBar';
 import {ProviderDrawer} from './components/ProviderDrawer';
 import {GlobalAppDialogHost} from './components/AppDialog';
+import {WebViewModal} from './components/WebViewModal';
 import {Home} from './screens/Home';
 import {Search} from './screens/Search';
 import {Library} from './screens/Library';
@@ -139,6 +140,7 @@ const VegaShell: React.FC = () => {
       </main>
       <ProviderDrawer />
       <GlobalAppDialogHost />
+      <WebViewModal />
     </div>
   );
 };

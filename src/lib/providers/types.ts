@@ -160,9 +160,11 @@ export interface ProviderKvStore {
 export interface OpenWebViewOptions {
   headers?: Record<string, string>;
   timeout?: number;
+  timeoutMs?: number;
   waitForSelector?: string;
   waitForCookie?: string;
   evaluateJs?: string;
+  injectedJavaScript?: string;
   title?: string;
   description?: string;
   force?: boolean;
@@ -177,6 +179,7 @@ export interface OpenWebViewResult {
   url: string;
   userAgent: string;
   evalResult?: string;
+  data?: any;
 }
 
 export type ProviderContext = {

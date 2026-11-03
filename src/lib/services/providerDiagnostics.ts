@@ -142,7 +142,7 @@ export async function testProvider(
 
     // Stage 2: Show list (posts)
     emit(2, 'Show list (posts)', 'running');
-    let firstPostLink = '';
+    let candidatePosts: Array<{title: string; link: string}> = [];
     try {
       const posts = await runProviderPosts(moduleData!.modules.posts!, {
         filter: firstFilter,
@@ -151,7 +151,10 @@ export async function testProvider(
         signal,
         sourceAuthor,
       });
-      if (!Array.isArray(posts) || posts.length === 0 || !posts[0]?.link) {
+      const validPosts = Array.isArray(posts)
+        ? posts.filter(p => p && typeof p.link === 'string' && p.link.trim())
+        : [];
+      if (validPosts.length === 0) {
         emit(2, 'Show list (posts)', 'fail', 'No posts returned');
         return {
           passed: false,
@@ -160,9 +163,9 @@ export async function testProvider(
           stagesCompleted,
         };
       }
-      firstPostLink = posts[0].link;
+      candidatePosts = validPosts.slice(0, 5);
       stagesCompleted.push('Show list (posts)');
-      emit(2, 'Show list (posts)', 'pass', `${posts.length} posts`);
+      emit(2, 'Show list (posts)', 'pass', `${validPosts.length} posts`);
     } catch (err) {
       if (signal.aborted) {
         return {passed: false, stagesCompleted, cancelled: true};
@@ -177,21 +180,46 @@ export async function testProvider(
       };
     }
 
-    // Stage 3: Metadata
+    // Stage 3: Metadata (try up to 5 candidate posts in case the first post is a pinned banner/notice)
     emit(3, 'Metadata', 'running');
-    let metaInfo: Awaited<ReturnType<typeof runProviderMeta>>;
+    let metaInfo: Awaited<ReturnType<typeof runProviderMeta>> | undefined;
+    let lastMetaError: unknown = null;
     try {
-      metaInfo = await runProviderMeta(moduleData!.modules.meta!, {
-        link: firstPostLink,
-        provider: provider.value,
-        signal,
-        sourceAuthor,
-      });
+      for (const post of candidatePosts) {
+        if (signal.aborted) {
+          return {passed: false, stagesCompleted, cancelled: true};
+        }
+        try {
+          const candidateMeta = await runProviderMeta(
+            moduleData!.modules.meta!,
+            {
+              link: post.link,
+              provider: provider.value,
+              signal,
+              sourceAuthor,
+            },
+          );
+          if (
+            candidateMeta &&
+            Array.isArray(candidateMeta.linkList) &&
+            candidateMeta.linkList.length > 0
+          ) {
+            metaInfo = candidateMeta;
+            break;
+          }
+        } catch (innerErr) {
+          lastMetaError = innerErr;
+        }
+      }
+
       if (
         !metaInfo ||
         !Array.isArray(metaInfo.linkList) ||
         metaInfo.linkList.length === 0
       ) {
+        if (lastMetaError) {
+          throw lastMetaError;
+        }
         emit(3, 'Metadata', 'fail', 'Metadata linkList is empty');
         return {
           passed: false,
@@ -218,59 +246,64 @@ export async function testProvider(
 
     // Stage 4: Playback (episodes/directLinks)
     emit(4, 'Playback (episodes/directLinks)', 'running');
-    let streamTargetLink = '';
-    let streamTargetType = metaInfo.type || 'movie';
+    const streamTargets: Array<{link: string; type: string}> = [];
+    let lastPlaybackError: unknown = null;
     try {
-      const firstGroup = metaInfo.linkList[0];
-      if (
-        Array.isArray(firstGroup.directLinks) &&
-        firstGroup.directLinks.length > 0 &&
-        firstGroup.directLinks[0]?.link
-      ) {
-        streamTargetLink = firstGroup.directLinks[0].link;
-        streamTargetType =
-          firstGroup.directLinks[0].type || metaInfo.type || 'movie';
-      } else if (firstGroup.episodesLink && moduleData!.modules.episodes) {
-        const episodes = await runProviderEpisodes(
-          moduleData!.modules.episodes,
-          {
-            url: firstGroup.episodesLink,
-            providerValue: provider.value,
-            signal,
-            sourceAuthor,
-          },
-        );
-        if (!Array.isArray(episodes) || !episodes[0]?.link) {
-          emit(
-            4,
-            'Playback (episodes/directLinks)',
-            'fail',
-            'getEpisodes returned no episodes',
-          );
-          return {
-            passed: false,
-            failedStage: 'Playback (episodes/directLinks)',
-            reason: 'getEpisodes returned no episodes',
-            stagesCompleted,
-          };
+      for (const group of metaInfo.linkList.slice(0, 4)) {
+        if (signal.aborted) {
+          return {passed: false, stagesCompleted, cancelled: true};
         }
-        streamTargetLink = episodes[0].link;
-        streamTargetType = 'series';
-      } else if (firstGroup.episodesLink) {
-        streamTargetLink = firstGroup.episodesLink;
+        if (Array.isArray(group.directLinks) && group.directLinks.length > 0) {
+          for (const dl of group.directLinks) {
+            if (dl?.link) {
+              streamTargets.push({
+                link: dl.link,
+                type: dl.type || metaInfo.type || 'movie',
+              });
+            }
+          }
+        } else if (group.episodesLink && moduleData!.modules.episodes) {
+          try {
+            const episodes = await runProviderEpisodes(
+              moduleData!.modules.episodes,
+              {
+                url: group.episodesLink,
+                providerValue: provider.value,
+                signal,
+                sourceAuthor,
+              },
+            );
+            if (Array.isArray(episodes)) {
+              for (const ep of episodes.slice(0, 3)) {
+                if (ep?.link) {
+                  streamTargets.push({link: ep.link, type: 'series'});
+                }
+              }
+            }
+          } catch (epErr) {
+            lastPlaybackError = epErr;
+          }
+        } else if (group.episodesLink) {
+          streamTargets.push({
+            link: group.episodesLink,
+            type: metaInfo.type || 'movie',
+          });
+        }
+        if (streamTargets.length >= 3) break;
       }
 
-      if (!streamTargetLink) {
-        emit(
-          4,
-          'Playback (episodes/directLinks)',
-          'fail',
-          'No playable episode or direct link found',
-        );
+      if (streamTargets.length === 0) {
+        if (lastPlaybackError) {
+          throw lastPlaybackError;
+        }
+        const failMsg = moduleData!.modules.episodes
+          ? 'getEpisodes returned no episodes'
+          : 'No playable episode or direct link found';
+        emit(4, 'Playback (episodes/directLinks)', 'fail', failMsg);
         return {
           passed: false,
           failedStage: 'Playback (episodes/directLinks)',
-          reason: 'No playable episode or direct link found',
+          reason: failMsg,
           stagesCompleted,
         };
       }
@@ -292,16 +325,35 @@ export async function testProvider(
 
     // Stage 5: Streams
     emit(5, 'Streams', 'running');
+    let resolvedStreamsCount = 0;
+    let lastStreamError: unknown = null;
     try {
-      const streams = await runProviderStream(moduleData!.modules.stream!, {
-        link: streamTargetLink,
-        type: streamTargetType,
-        providerValue: provider.value,
-        isDownload: false,
-        signal,
-        sourceAuthor,
-      });
-      if (!Array.isArray(streams) || streams.length === 0 || !streams[0]?.link) {
+      for (const target of streamTargets.slice(0, 3)) {
+        if (signal.aborted) {
+          return {passed: false, stagesCompleted, cancelled: true};
+        }
+        try {
+          const streams = await runProviderStream(moduleData!.modules.stream!, {
+            link: target.link,
+            type: target.type,
+            providerValue: provider.value,
+            isDownload: false,
+            signal,
+            sourceAuthor,
+          });
+          if (Array.isArray(streams) && streams.length > 0 && streams[0]?.link) {
+            resolvedStreamsCount = streams.length;
+            break;
+          }
+        } catch (streamErr) {
+          lastStreamError = streamErr;
+        }
+      }
+
+      if (resolvedStreamsCount === 0) {
+        if (lastStreamError) {
+          throw lastStreamError;
+        }
         emit(5, 'Streams', 'fail', 'getStream returned no playable streams');
         return {
           passed: false,
@@ -311,7 +363,7 @@ export async function testProvider(
         };
       }
       stagesCompleted.push('Streams');
-      emit(5, 'Streams', 'pass', `${streams.length} stream(s) resolved`);
+      emit(5, 'Streams', 'pass', `${resolvedStreamsCount} stream(s) resolved`);
       return {
         passed: true,
         stagesCompleted,

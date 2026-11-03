@@ -960,6 +960,26 @@ export async function runProviderCatalog(
   return {catalog, genres};
 }
 
+function filterValidProviderPosts(posts: Post[]): Post[] {
+  if (!Array.isArray(posts)) return [];
+  const filtered = posts.filter(post => {
+    if (!post || typeof post.link !== 'string' || !post.link.trim()) {
+      return false;
+    }
+    const cleanLink = post.link.trim().replace(/^https?:\/\/[^/]+/i, '');
+    const cleanTitle = (post.title || '').trim();
+    // Filter out cross-site promo redirect cards on KatMoviesHd (/pikahd, /katdrama) and similar notice banners
+    if (/^\/?(?:pikahd|katdrama|telegram|join-telegram|how-to-download)\/?$/i.test(cleanLink)) {
+      return false;
+    }
+    if (/^new\s+(?:anime|show|movie|drama|series)s?\s+updated\s+on\s+/i.test(cleanTitle)) {
+      return false;
+    }
+    return true;
+  });
+  return filtered.length > 0 ? filtered : posts;
+}
+
 export async function runProviderPosts(
   code: string,
   params: {
@@ -989,7 +1009,7 @@ export async function runProviderPosts(
     signal: params.signal || new AbortController().signal,
     providerContext,
   });
-  return Array.isArray(res) ? res : [];
+  return Array.isArray(res) ? filterValidProviderPosts(res) : [];
 }
 
 export async function runProviderSearchPosts(
@@ -1021,7 +1041,7 @@ export async function runProviderSearchPosts(
     signal: params.signal || new AbortController().signal,
     providerContext,
   });
-  return Array.isArray(res) ? res : [];
+  return Array.isArray(res) ? filterValidProviderPosts(res) : [];
 }
 
 export async function runProviderMeta(

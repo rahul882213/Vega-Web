@@ -190,11 +190,18 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Decoder & Transcode state
+  const isRemoteTranscodeHost =
+    typeof window !== 'undefined' &&
+    !window.location.hostname.includes('localhost') &&
+    !window.location.hostname.includes('127.0.0.1') &&
+    !window.location.hostname.endsWith('.run.app');
   const [decoderMode, setDecoderMode] = useState<DecoderMode>('hw');
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
     null,
   );
-  const [apiBaseUrl, setApiBaseUrl] = useState<string>('');
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>(() =>
+    isRemoteTranscodeHost ? REMOTE_STREAM_BACKEND : '',
+  );
   const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(false);
   const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
@@ -365,7 +372,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     }
 
     const probeStreamWithFallback = async () => {
-      const candidates = ['', REMOTE_STREAM_BACKEND];
+      const candidates = isRemoteTranscodeHost
+        ? [REMOTE_STREAM_BACKEND, '']
+        : ['', REMOTE_STREAM_BACKEND];
       for (const base of candidates) {
         try {
           const r = await fetch(`${base}/api/probe-stream?${params.toString()}`);
@@ -515,7 +524,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     }
 
     // Live FFmpeg Remux ('hw') or Software Transcode ('sw')
-    const transcodeBase = apiBaseUrl || '';
+    const transcodeBase =
+      apiBaseUrl || (isRemoteTranscodeHost ? REMOTE_STREAM_BACKEND : '');
     const params = new URLSearchParams({
       url: rawLink,
       start: String(Math.floor(transcodeOffset)),

@@ -71,8 +71,7 @@ type SleepOption = 'off' | 'episode' | number;
 
 const SLEEP_PRESETS: SleepOption[] = ['off', 15, 30, 45, 60, 90, 'episode'];
 
-const REMOTE_STREAM_BACKEND =
-  'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app';
+const REMOTE_STREAM_BACKEND = 'https://vegawebs.netlify.app';
 
 const LANGUAGE_NAMES: Record<string, string> = {
   en: 'English',
@@ -192,9 +191,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Decoder & Transcode state
   const isRemoteTranscodeHost =
     typeof window !== 'undefined' &&
-    !window.location.hostname.includes('localhost') &&
-    !window.location.hostname.includes('127.0.0.1') &&
-    !window.location.hostname.endsWith('.run.app');
+    (window.location.hostname.endsWith('github.io') ||
+      (!window.location.hostname.includes('localhost') &&
+        !window.location.hostname.includes('127.0.0.1') &&
+        !window.location.hostname.includes('netlify.app') &&
+        !window.location.hostname.endsWith('.run.app')));
   const [decoderMode, setDecoderMode] = useState<DecoderMode>('hw');
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
     null,
@@ -503,13 +504,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       return rawLink;
     }
 
-    const proxyBase = useRemoteProxyFallback
-      ? REMOTE_STREAM_BACKEND
-      : apiBaseUrl &&
-          typeof window !== 'undefined' &&
-          window.location.hostname.endsWith('github.io')
-        ? apiBaseUrl
-        : '';
+    const proxyBase =
+      useRemoteProxyFallback ||
+      (typeof window !== 'undefined' &&
+        window.location.hostname.endsWith('github.io'))
+        ? REMOTE_STREAM_BACKEND
+        : apiBaseUrl || '';
 
     if (
       isHlsStream ||
@@ -706,7 +706,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           if (encodedStreamHeaders) {
             subParams.set('headers', encodedStreamHeaders);
           }
-          const bases = ['', REMOTE_STREAM_BACKEND];
+          const isGhPages =
+            typeof window !== 'undefined' &&
+            window.location.hostname.endsWith('github.io');
+          const bases = isGhPages
+            ? [REMOTE_STREAM_BACKEND, '']
+            : ['', REMOTE_STREAM_BACKEND];
           for (const base of bases) {
             try {
               const res = await fetch(
@@ -1049,11 +1054,21 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     if (selectedStream.link.startsWith('http')) {
       const hasCustomHeaders = Boolean(encodedStreamHeaders);
       if (!hasCustomHeaders) return selectedStream.link;
-      return `${window.location.origin}/api/stream-proxy?url=${encodeURIComponent(
+      const originBase =
+        typeof window !== 'undefined' &&
+        window.location.hostname.endsWith('github.io')
+          ? REMOTE_STREAM_BACKEND
+          : window.location.origin;
+      return `${originBase}/api/stream-proxy?url=${encodeURIComponent(
         selectedStream.link,
       )}&headers=${encodeURIComponent(encodedStreamHeaders)}`;
     }
-    return `${window.location.origin}${selectedStream.link}`;
+    const originBase =
+      typeof window !== 'undefined' &&
+      window.location.hostname.endsWith('github.io')
+        ? REMOTE_STREAM_BACKEND
+        : window.location.origin;
+    return `${originBase}${selectedStream.link}`;
   }, [selectedStream?.link, encodedStreamHeaders]);
 
   return (
@@ -2420,7 +2435,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                     </button>
 
                     <a
-                      href={`/api/stream-proxy?url=${encodeURIComponent(
+                      href={`${
+                        typeof window !== 'undefined' &&
+                        window.location.hostname.endsWith('github.io')
+                          ? REMOTE_STREAM_BACKEND
+                          : ''
+                      }/api/stream-proxy?url=${encodeURIComponent(
                         selectedStream.link,
                       )}${
                         encodedStreamHeaders

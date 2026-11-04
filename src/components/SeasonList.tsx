@@ -14,7 +14,7 @@ import {EpisodeLink, Link} from '../lib/providers/types';
 import {useM3Colors} from '../theme/M3PaletteContext';
 import {useVegaNavigation} from '../NavigationContext';
 import {providerManager} from '../lib/services/ProviderManager';
-import {mainStorage, cacheStorage} from '../lib/storage';
+import {mainStorage, cacheStorage, getEffectiveApiBaseUrl} from '../lib/storage';
 import useContinueWatchingStore from '../lib/zustand/continueWatchingStore';
 import useDownloadsStore from '../lib/zustand/downloadsStore';
 import {showAppDialog} from '../lib/zustand/appDialogStore';
@@ -277,7 +277,8 @@ export const SeasonList: React.FC<SeasonListProps> = ({
       const encodedHeaders = chosen.headers
         ? window.btoa(JSON.stringify(chosen.headers))
         : '';
-      const proxyUrl = `/api/stream-proxy?url=${encodeURIComponent(chosen.link)}${
+      const apiPrefix = getEffectiveApiBaseUrl();
+      const proxyUrl = `${apiPrefix}/api/stream-proxy?url=${encodeURIComponent(chosen.link)}${
         encodedHeaders ? `&headers=${encodeURIComponent(encodedHeaders)}` : ''
       }`;
 

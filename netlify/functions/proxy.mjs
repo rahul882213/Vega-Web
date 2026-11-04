@@ -9,8 +9,6 @@ const httpsAgent = new https.Agent({
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const FALLBACK_ASIA_PROXY =
-  'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app/api/proxy';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -153,28 +151,6 @@ export async function handler(event) {
       }),
     };
   } catch (error) {
-    // Fallback to Asia-East Cloud Run proxy on network error
-    try {
-      const fbRes = await axios.post(
-        FALLBACK_ASIA_PROXY,
-        event.body ? JSON.parse(event.body) : {},
-        {
-          headers: {'Content-Type': 'application/json'},
-          timeout: 20000,
-          validateStatus: () => true,
-        },
-      );
-      if (fbRes.status === 200 && fbRes.data) {
-        return {
-          statusCode: 200,
-          headers: CORS_HEADERS,
-          body: JSON.stringify(fbRes.data),
-        };
-      }
-    } catch {
-      // Ignore fallback error
-    }
-
     return {
       statusCode: 502,
       headers: CORS_HEADERS,

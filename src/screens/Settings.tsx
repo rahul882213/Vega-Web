@@ -16,6 +16,7 @@ import {
   ExternalLink,
   Loader2,
   Check,
+  Server,
 } from 'lucide-react';
 import {useM3Colors} from '../theme/M3PaletteContext';
 import {useVegaNavigation} from '../NavigationContext';
@@ -27,6 +28,9 @@ import {
   clearAllMMKVStorage,
   mainStorage,
   extensionStorage,
+  settingsStorage,
+  getEffectiveApiBaseUrl,
+  isStaticOrGitHubPagesHost,
 } from '../lib/storage';
 import {showAppDialog} from '../lib/zustand/appDialogStore';
 
@@ -44,6 +48,10 @@ export const Settings: React.FC = () => {
   const [githubPushing, setGithubPushing] = useState(false);
   const [pushedRepoUrl, setPushedRepoUrl] = useState<string | null>(null);
 
+  const [remoteBackendUrl, setRemoteBackendUrlState] = useState(() =>
+    settingsStorage.getRemoteBackendUrl(),
+  );
+
   const handlePushToGithub = async () => {
     if (!githubToken.trim()) {
       showAppDialog({
@@ -57,7 +65,8 @@ export const Settings: React.FC = () => {
 
     setGithubPushing(true);
     try {
-      const res = await fetch('/api/github/push', {
+      const apiPrefix = getEffectiveApiBaseUrl();
+      const res = await fetch(`${apiPrefix}/api/github/push`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -413,6 +422,97 @@ export const Settings: React.FC = () => {
                 </a>
               </div>
             )}
+          </div>
+        </section>
+
+        {/* Remote Backend & Proxy Server (For GitHub Pages & Static Hosts) */}
+        <section>
+          <p
+            className="text-xs font-bold uppercase tracking-wider mb-2.5 px-1"
+            style={{color: colors.primary}}>
+            API & Stream Backend
+          </p>
+          <div
+            className="rounded-2xl border p-4 space-y-3"
+            style={{
+              backgroundColor: colors.surfaceContainerLow,
+              borderColor: colors.outlineVariant,
+            }}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <Server size={19} style={{color: colors.primary}} />
+                <div>
+                  <p
+                    className="text-sm font-semibold"
+                    style={{color: colors.onSurface}}>
+                    Remote Proxy Server
+                  </p>
+                  <p
+                    className="text-xs"
+                    style={{color: colors.onSurfaceVariant}}>
+                    Used on GitHub Pages and static hosts to bypass browser CORS and stream video chunks
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+              <input
+                type="text"
+                value={remoteBackendUrl}
+                onChange={e => setRemoteBackendUrlState(e.target.value)}
+                placeholder="https://vegawebs.netlify.app"
+                className="flex-1 h-9 px-3 rounded-xl border text-xs outline-none"
+                style={{
+                  backgroundColor: colors.surfaceContainerHigh,
+                  borderColor: colors.outlineVariant,
+                  color: colors.onSurface,
+                }}
+              />
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const trimmed =
+                      remoteBackendUrl.trim() || 'https://vegawebs.netlify.app';
+                    settingsStorage.setRemoteBackendUrl(trimmed);
+                    setRemoteBackendUrlState(
+                      settingsStorage.getRemoteBackendUrl(),
+                    );
+                    showAppDialog({
+                      title: 'Backend Saved',
+                      message: `Remote backend set to: ${settingsStorage.getRemoteBackendUrl()}`,
+                      variant: 'success',
+                    });
+                  }}
+                  className="h-9 px-4 rounded-full text-xs font-bold cursor-pointer shrink-0"
+                  style={{
+                    backgroundColor: colors.primary,
+                    color: colors.onPrimary,
+                  }}>
+                  Save
+                </button>
+                <button
+                  onClick={() => {
+                    settingsStorage.setRemoteBackendUrl(
+                      'https://vegawebs.netlify.app',
+                    );
+                    setRemoteBackendUrlState('https://vegawebs.netlify.app');
+                    showAppDialog({
+                      title: 'Reset to Default',
+                      message:
+                        'Reset remote backend to default: https://vegawebs.netlify.app',
+                      variant: 'default',
+                    });
+                  }}
+                  className="h-9 px-3 rounded-full text-xs font-semibold cursor-pointer shrink-0"
+                  style={{
+                    backgroundColor: colors.surfaceContainerHigh,
+                    color: colors.onSurface,
+                  }}>
+                  Reset
+                </button>
+              </div>
+            </div>
           </div>
         </section>
 

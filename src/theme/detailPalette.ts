@@ -1,7 +1,7 @@
 import {useEffect, useState} from 'react';
 import type {M3Palette} from './colors';
 import {useM3Colors} from './M3PaletteContext';
-import {settingsStorage} from '../lib/storage';
+import {settingsStorage, getEffectiveApiBaseUrl} from '../lib/storage';
 
 export function useDetailSeedPalette(imageUrl?: string): M3Palette {
   const basePalette = useM3Colors();
@@ -23,7 +23,8 @@ export function useDetailSeedPalette(imageUrl?: string): M3Palette {
     let cancelled = false;
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    const proxyUrl = `/api/stream-proxy?url=${encodeURIComponent(imageUrl)}`;
+    const apiPrefix = getEffectiveApiBaseUrl();
+    const proxyUrl = `${apiPrefix}/api/stream-proxy?url=${encodeURIComponent(imageUrl)}`;
     img.onload = () => {
       if (cancelled) return;
       try {

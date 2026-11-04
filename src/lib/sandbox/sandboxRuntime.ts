@@ -10,6 +10,8 @@ import {
   providerKvStorage,
   providerCookieStorage,
   extensionStorage,
+  settingsStorage,
+  isStaticOrGitHubPagesHost,
 } from '../storage';
 import {useWebViewModalStore} from '../zustand/webViewModalStore';
 import type {
@@ -324,12 +326,23 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy, /.netlify/functions/proxy, and Asia-East Cloud Run relay)
-  const proxyEndpoints = [
-    '/api/proxy',
-    '/.netlify/functions/proxy',
-    'https://ais-pre-4fyigz64hr3uom7v3grsu4-875462501212.asia-east1.run.app/api/proxy',
-  ];
+  // 2. Try backend proxy (/api/proxy, /.netlify/functions/proxy, and remote Netlify backend)
+  const isStaticHost = isStaticOrGitHubPagesHost();
+  const remoteBackend = settingsStorage.getRemoteBackendUrl();
+
+  const proxyEndpoints = isStaticHost
+    ? [
+        `${remoteBackend}/api/proxy`,
+        `${remoteBackend}/.netlify/functions/proxy`,
+        '/api/proxy',
+        '/.netlify/functions/proxy',
+      ]
+    : [
+        '/api/proxy',
+        '/.netlify/functions/proxy',
+        `${remoteBackend}/api/proxy`,
+        `${remoteBackend}/.netlify/functions/proxy`,
+      ];
 
   let blockedResult: {
     status: number;

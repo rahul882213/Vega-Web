@@ -9,6 +9,7 @@ import {
 import {useM3Colors} from '../theme/M3PaletteContext';
 import {useVegaNavigation} from '../NavigationContext';
 import useDownloadsStore, {DownloadItem} from '../lib/zustand/downloadsStore';
+import {getEffectiveApiBaseUrl} from '../lib/storage';
 
 export const Downloads: React.FC = () => {
   const colors = useM3Colors();
@@ -126,7 +127,8 @@ export const Downloads: React.FC = () => {
               const encodedHeaders = item.headers
                 ? window.btoa(JSON.stringify(item.headers))
                 : '';
-              const directDownloadUrl = `/api/stream-proxy?url=${encodeURIComponent(
+              const apiPrefix = getEffectiveApiBaseUrl();
+              const directDownloadUrl = `${apiPrefix}/api/stream-proxy?url=${encodeURIComponent(
                 item.url,
               )}${
                 encodedHeaders

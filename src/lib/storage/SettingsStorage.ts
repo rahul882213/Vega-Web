@@ -47,6 +47,7 @@ export enum SettingsKeys {
   TMDB_API_KEY_REVISION = 'tmdbApiKeyRevision',
   SKIP_IN_APP_WEBVIEW = 'skipInAppWebview',
   ASK_LOCAL_FILE_FIRST = 'askLocalFileFirst',
+  CUSTOM_REMOTE_BACKEND = 'customRemoteBackend',
 }
 
 export const BUFFER_LIMITS = {
@@ -461,6 +462,42 @@ export class SettingsStorage {
   setSkipInAppWebview(skip: boolean): void {
     mainStorage.setBool(SettingsKeys.SKIP_IN_APP_WEBVIEW, skip);
   }
+
+  getRemoteBackendUrl(): string {
+    const custom = mainStorage.getString(SettingsKeys.CUSTOM_REMOTE_BACKEND);
+    if (custom && custom.trim()) {
+      return custom.trim().replace(/\/+$/, '');
+    }
+    return 'https://vegawebs.netlify.app';
+  }
+
+  setRemoteBackendUrl(url: string): void {
+    const trimmed = url.trim().replace(/\/+$/, '');
+    if (trimmed) {
+      mainStorage.setString(SettingsKeys.CUSTOM_REMOTE_BACKEND, trimmed);
+    } else {
+      mainStorage.delete(SettingsKeys.CUSTOM_REMOTE_BACKEND);
+    }
+  }
 }
 
 export const settingsStorage = new SettingsStorage();
+
+export function isStaticOrGitHubPagesHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname.toLowerCase();
+  return (
+    host.endsWith('github.io') ||
+    (!host.includes('localhost') &&
+      !host.includes('127.0.0.1') &&
+      !host.includes('netlify.app') &&
+      !host.endsWith('.run.app'))
+  );
+}
+
+export function getEffectiveApiBaseUrl(): string {
+  if (isStaticOrGitHubPagesHost()) {
+    return settingsStorage.getRemoteBackendUrl();
+  }
+  return '';
+}

@@ -47,7 +47,7 @@ function clampRangeHeader(rangeHeader, maxChunk = MAX_RANGE_CHUNK_BYTES) {
   return `bytes=${start}-${clampedEnd}`;
 }
 
-function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders) {
+function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders, hostPrefix = '') {
   const buildProxyUrl = rawTarget => {
     try {
       const resolved = new URL(rawTarget.trim(), baseUrl).toString();
@@ -56,7 +56,7 @@ function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders) {
       if (encodedHeaders) {
         params.set('headers', encodedHeaders);
       }
-      return `/api/stream-proxy?${params.toString()}`;
+      return `${hostPrefix}/api/stream-proxy?${params.toString()}`;
     } catch {
       return rawTarget;
     }
@@ -168,10 +168,16 @@ export async function handler(event) {
     if (isM3u8 && upstream.status >= 200 && upstream.status < 300) {
       const rawText = rawBuffer.toString('utf8');
       if (rawText.trimStart().startsWith('#EXTM3U')) {
+        const requestHost =
+          event.headers?.['x-forwarded-host'] ||
+          event.headers?.host ||
+          'vegawebs.netlify.app';
+        const hostPrefix = `https://${requestHost}`;
         const rewritten = rewriteM3u8Playlist(
           rawText,
           finalUrl,
           encodedHeaders,
+          hostPrefix,
         );
         return {
           statusCode: upstream.status,

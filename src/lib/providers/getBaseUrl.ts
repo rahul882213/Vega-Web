@@ -1,4 +1,4 @@
-import {cacheStorageService} from '../storage';
+import {cacheStorageService, getEffectiveApiBaseUrl} from '../storage';
 
 const EXPIRE_TIME = 60 * 60 * 1000;
 const MODFLIX_JSON_URL = 'https://himanshu8443.github.io/providers/modflix.json';
@@ -44,8 +44,9 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
 
     // 1. Try backend /api/base-url endpoint
     try {
+      const apiPrefix = getEffectiveApiBaseUrl();
       const res = await fetch(
-        `/api/base-url?provider=${encodeURIComponent(providerValue)}`,
+        `${apiPrefix}/api/base-url?provider=${encodeURIComponent(providerValue)}`,
       );
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {

@@ -20,6 +20,8 @@ export {
   PLAYBACK_SPEED_MAX,
   PLAYBACK_SPEED_STEP,
   PLAYER_RESIZE_MODES,
+  isStaticOrGitHubPagesHost,
+  getEffectiveApiBaseUrl,
 } from './SettingsStorage';
 export type {
   SettingsKeys,

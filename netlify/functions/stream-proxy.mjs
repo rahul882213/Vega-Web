@@ -1,4 +1,4 @@
-import http2 from 'node:http2';
+import http2 from 'http2';
 import axios from 'axios';
 import https from 'https';
 

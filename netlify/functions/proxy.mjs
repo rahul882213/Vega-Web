@@ -90,35 +90,6 @@ export async function handler(event) {
       httpsAgent,
     });
 
-    // If Cloudflare/WAF blocks AWS US-East datacenter IP (403 / 503), relay through the Asia-East Cloud Run proxy
-    if (
-      response.status === 403 ||
-      response.status === 503 ||
-      response.status === 429
-    ) {
-      try {
-        const fbRes = await axios.post(FALLBACK_ASIA_PROXY, payload, {
-          headers: {'Content-Type': 'application/json'},
-          timeout: 20000,
-          validateStatus: () => true,
-        });
-        if (
-          fbRes.status === 200 &&
-          fbRes.data &&
-          typeof fbRes.data.status === 'number' &&
-          fbRes.data.status < 400
-        ) {
-          return {
-            statusCode: 200,
-            headers: CORS_HEADERS,
-            body: JSON.stringify(fbRes.data),
-          };
-        }
-      } catch {
-        // Return original response if fallback is unreachable
-      }
-    }
-
     const responseHeaders = {};
     for (const [key, val] of Object.entries(response.headers || {})) {
       if (val === undefined) continue;

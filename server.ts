@@ -7,6 +7,7 @@ import path from 'path';
 import {fileURLToPath} from 'url';
 import axios from 'axios';
 import https from 'https';
+import http2 from 'http2';
 
 const execFileAsync = promisify(execFile);
 
@@ -586,6 +587,131 @@ async function startServer() {
     });
   });
 
+  function streamViaHttp2(
+    targetUrl: string,
+    outgoingHeaders: Record<string, string>,
+    res: express.Response,
+    req: express.Request,
+    isDownload: boolean,
+    redirectsLeft = 5,
+  ) {
+    try {
+      const parsed = new URL(targetUrl);
+      const client = http2.connect(parsed.origin);
+
+      client.on('error', err => {
+        if (!res.headersSent) {
+          res.status(502).send(err?.message || 'HTTP/2 connection error');
+        }
+      });
+
+      const h2Headers: Record<string, string> = {
+        ':method': 'GET',
+        ':path': parsed.pathname + parsed.search,
+      };
+
+      for (const [k, v] of Object.entries(outgoingHeaders)) {
+        const lower = k.toLowerCase();
+        if (
+          lower === 'host' ||
+          lower === 'connection' ||
+          lower === 'keep-alive' ||
+          lower === 'transfer-encoding' ||
+          lower === 'upgrade' ||
+          lower === 'http2-settings'
+        ) {
+          continue;
+        }
+        h2Headers[lower] = String(v);
+      }
+
+      const h2Req = client.request(h2Headers);
+
+      h2Req.on('response', respHeaders => {
+        const statusCode = Number(respHeaders[':status'] || 200);
+
+        if (
+          statusCode >= 300 &&
+          statusCode < 400 &&
+          respHeaders['location'] &&
+          redirectsLeft > 0
+        ) {
+          h2Req.destroy();
+          client.close();
+          const redirectUrl = new URL(
+            String(respHeaders['location']),
+            targetUrl,
+          ).toString();
+          return streamViaHttp2(
+            redirectUrl,
+            outgoingHeaders,
+            res,
+            req,
+            isDownload,
+            redirectsLeft - 1,
+          );
+        }
+
+        res.status(statusCode);
+
+        const forwardHeaders = [
+          'content-length',
+          'content-range',
+          'accept-ranges',
+          'cache-control',
+          'last-modified',
+          'etag',
+        ];
+        for (const h of forwardHeaders) {
+          const val = respHeaders[h];
+          if (val !== undefined) {
+            res.setHeader(h, Array.isArray(val) ? val.join(', ') : String(val));
+          }
+        }
+
+        const contentType = String(respHeaders['content-type'] || '').toLowerCase();
+        if (isDownload) {
+          res.setHeader(
+            'Content-Type',
+            String(respHeaders['content-type'] || 'application/octet-stream'),
+          );
+        } else if (
+          !contentType ||
+          contentType.includes('octet-stream') ||
+          contentType.includes('matroska') ||
+          contentType.includes('mkv')
+        ) {
+          res.setHeader('Content-Type', 'video/mp4');
+        } else {
+          res.setHeader('Content-Type', String(respHeaders['content-type']));
+        }
+
+        if (!res.getHeader('accept-ranges')) {
+          res.setHeader('Accept-Ranges', 'bytes');
+        }
+
+        h2Req.pipe(res);
+      });
+
+      h2Req.on('error', err => {
+        if (!res.headersSent) {
+          res.status(502).send(err?.message || 'HTTP/2 stream error');
+        } else {
+          res.end();
+        }
+      });
+
+      req.on('close', () => {
+        h2Req.destroy();
+        client.close();
+      });
+    } catch (err: any) {
+      if (!res.headersSent) {
+        res.status(502).send(err?.message || 'HTTP/2 setup error');
+      }
+    }
+  }
+
   // Direct Byte-Range & HLS Stream Proxy
   app.get('/api/stream-proxy', async (req, res) => {
     try {
@@ -615,6 +741,16 @@ async function startServer() {
         outgoingHeaders['Range'] = req.headers.range;
       }
 
+      const isKnownH2Host =
+        targetUrl.includes('hakunaymatata.com') ||
+        targetUrl.includes('aoneroom.com') ||
+        targetUrl.includes('bcdnxw') ||
+        targetUrl.includes('moviebox');
+
+      if (isKnownH2Host) {
+        return streamViaHttp2(targetUrl, outgoingHeaders, res, req, isDownload);
+      }
+
       const upstream = await axios.get(targetUrl, {
         headers: outgoingHeaders,
         responseType: 'stream',
@@ -623,6 +759,10 @@ async function startServer() {
         timeout: 30000,
         httpsAgent,
       });
+
+      if (upstream.status === 426 || upstream.status === 428) {
+        return streamViaHttp2(targetUrl, outgoingHeaders, res, req, isDownload);
+      }
 
       const finalUrl =
         upstream.request?.res?.responseUrl || upstream.config?.url || targetUrl;

@@ -1,3 +1,4 @@
+import http2 from 'node:http2';
 import axios from 'axios';
 import https from 'https';
 
@@ -9,8 +10,8 @@ const httpsAgent = new https.Agent({
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// 3.5 MB chunk size so base64-encoded body (~4.67 MB) stays safely under Netlify's 6 MB Lambda response limit
-const MAX_RANGE_CHUNK_BYTES = 3584 * 1024;
+// 2.5 MB chunk size so base64-encoded body (~3.33 MB) stays safely under Netlify's serverless response limits
+const MAX_RANGE_CHUNK_BYTES = 2560 * 1024;
 
 function parseEncodedHeaders(encodedHeaders) {
   const customHeaders = {};
@@ -77,6 +78,116 @@ function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders, hostPrefix =
     .join('\n');
 }
 
+function fetchViaHttp2(targetUrl, outgoingHeaders, timeoutMs = 25000, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    let client;
+    let req;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        if (req && typeof req.destroy === 'function') req.destroy();
+        if (client && typeof client.close === 'function') client.close();
+        reject(new Error('HTTP/2 request timeout'));
+      }
+    }, timeoutMs);
+
+    try {
+      const parsed = new URL(targetUrl);
+      client = http2.connect(parsed.origin);
+
+      client.on('error', err => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+
+      const h2Headers = {
+        ':method': 'GET',
+        ':path': parsed.pathname + parsed.search,
+      };
+
+      for (const [k, v] of Object.entries(outgoingHeaders)) {
+        const lower = k.toLowerCase();
+        if (
+          lower === 'host' ||
+          lower === 'connection' ||
+          lower === 'keep-alive' ||
+          lower === 'transfer-encoding' ||
+          lower === 'upgrade' ||
+          lower === 'http2-settings'
+        ) {
+          continue;
+        }
+        h2Headers[lower] = String(v);
+      }
+
+      req = client.request(h2Headers);
+      let respHeaders = {};
+      const chunks = [];
+
+      req.on('response', headers => {
+        respHeaders = headers;
+      });
+
+      req.on('data', chunk => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+
+      req.on('end', () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          if (client && typeof client.close === 'function') client.close();
+          const statusCode = Number(respHeaders[':status'] || 200);
+
+          if (
+            statusCode >= 300 &&
+            statusCode < 400 &&
+            respHeaders['location'] &&
+            redirectsLeft > 0
+          ) {
+            const nextUrl = new URL(
+              String(respHeaders['location']),
+              targetUrl,
+            ).toString();
+            return resolve(
+              fetchViaHttp2(nextUrl, outgoingHeaders, timeoutMs, redirectsLeft - 1),
+            );
+          }
+
+          resolve({
+            status: statusCode,
+            headers: respHeaders,
+            data: Buffer.concat(chunks),
+            finalUrl: targetUrl,
+          });
+        }
+      });
+
+      req.on('error', err => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          if (client && typeof client.close === 'function') client.close();
+          reject(err);
+        }
+      });
+
+      req.end();
+    } catch (err) {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        if (client && typeof client.close === 'function') client.close();
+        reject(err);
+      }
+    }
+  });
+}
+
 export async function handler(event) {
   if (event.httpMethod === 'OPTIONS') {
     return {
@@ -132,25 +243,70 @@ export async function handler(event) {
     const incomingRange =
       event.headers?.range || event.headers?.Range || undefined;
 
-    // For direct MP4/MKV streams (such as MovieBox Web), clamp each HTTP Range request to 3.5 MB
-    // so Netlify Functions never exceed the 6 MB response cap while keeping custom Referer/Origin headers intact
+    // For direct MP4/MKV streams (such as MovieBox Web), clamp each HTTP Range request to 2.5 MB
+    // so Netlify Functions never exceed serverless payload limits while preserving custom Referer/Origin headers
     if (!isLikelyM3u8 && !isTextSubtitle && !isHlsSegment) {
       outgoingHeaders['Range'] = clampRangeHeader(incomingRange);
     } else if (incomingRange) {
       outgoingHeaders['Range'] = incomingRange;
     }
 
-    const upstream = await axios.get(targetUrl, {
-      headers: outgoingHeaders,
-      responseType: 'arraybuffer',
-      maxRedirects: 8,
-      validateStatus: () => true,
-      timeout: 25000,
-      httpsAgent,
-    });
+    const isKnownH2Host =
+      targetUrl.includes('hakunaymatata.com') ||
+      targetUrl.includes('aoneroom.com') ||
+      targetUrl.includes('bcdnxw') ||
+      targetUrl.includes('moviebox');
 
-    const finalUrl =
-      upstream.request?.res?.responseUrl || upstream.config?.url || targetUrl;
+    let upstream;
+    if (isKnownH2Host) {
+      try {
+        upstream = await fetchViaHttp2(targetUrl, outgoingHeaders, 25000);
+      } catch (h2Err) {
+        console.warn('Direct HTTP/2 failed, falling back to axios:', h2Err?.message);
+      }
+    }
+
+    if (!upstream || upstream.status === 426 || upstream.status === 428) {
+      const axiosRes = await axios.get(targetUrl, {
+        headers: outgoingHeaders,
+        responseType: 'arraybuffer',
+        maxRedirects: 8,
+        validateStatus: () => true,
+        timeout: 25000,
+        httpsAgent,
+      });
+
+      if (
+        (axiosRes.status === 426 || axiosRes.status === 428) &&
+        !isKnownH2Host
+      ) {
+        try {
+          upstream = await fetchViaHttp2(targetUrl, outgoingHeaders, 25000);
+        } catch {
+          upstream = {
+            status: axiosRes.status,
+            headers: axiosRes.headers,
+            data: axiosRes.data,
+            finalUrl:
+              axiosRes.request?.res?.responseUrl ||
+              axiosRes.config?.url ||
+              targetUrl,
+          };
+        }
+      } else {
+        upstream = {
+          status: axiosRes.status,
+          headers: axiosRes.headers,
+          data: axiosRes.data,
+          finalUrl:
+            axiosRes.request?.res?.responseUrl ||
+            axiosRes.config?.url ||
+            targetUrl,
+        };
+      }
+    }
+
+    const finalUrl = upstream.finalUrl || targetUrl;
     const contentType = String(
       upstream.headers['content-type'] || '',
     ).toLowerCase();

@@ -90,6 +90,86 @@ export async function handler(event) {
       httpsAgent,
     });
 
+    // If Cloudflare/WAF blocks AWS Lambda IP (403 / 429 / 503) on GET, relay via public fetch proxies
+    const upperMethod = String(method).toUpperCase();
+    if (
+      upperMethod === 'GET' &&
+      (response.status === 403 ||
+        response.status === 429 ||
+        response.status === 503)
+    ) {
+      try {
+        const aoRes = await axios.get(
+          `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+          {timeout: 14000, validateStatus: () => true},
+        );
+        const contents = aoRes.data?.contents;
+        const httpCode = Number(aoRes.data?.status?.http_code || 0);
+        if (
+          aoRes.status === 200 &&
+          typeof contents === 'string' &&
+          contents.length > 0 &&
+          httpCode >= 200 &&
+          httpCode < 400 &&
+          !contents.includes('<title>Just a moment...</title>')
+        ) {
+          return {
+            statusCode: 200,
+            headers: CORS_HEADERS,
+            body: JSON.stringify({
+              status: httpCode,
+              statusText: 'OK',
+              url: aoRes.data?.status?.url || url,
+              headers: {
+                'content-type':
+                  aoRes.data?.status?.content_type ||
+                  'text/html; charset=utf-8',
+              },
+              bodyBase64: Buffer.from(contents, 'utf8').toString('base64'),
+            }),
+          };
+        }
+      } catch {
+        // Continue to next relay
+      }
+
+      try {
+        const ctRes = await axios.get(
+          `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+          {
+            responseType: 'arraybuffer',
+            timeout: 12000,
+            validateStatus: () => true,
+          },
+        );
+        if (ctRes.status >= 200 && ctRes.status < 400 && ctRes.data) {
+          const buf = Buffer.isBuffer(ctRes.data)
+            ? ctRes.data
+            : Buffer.from(ctRes.data);
+          const preview = buf.slice(0, 512).toString('utf8');
+          if (!preview.includes('<title>Just a moment...</title>')) {
+            return {
+              statusCode: 200,
+              headers: CORS_HEADERS,
+              body: JSON.stringify({
+                status: ctRes.status,
+                statusText: 'OK',
+                url,
+                headers: {
+                  'content-type':
+                    String(ctRes.headers['content-type'] || '') ||
+                    'text/html; charset=utf-8',
+                },
+                bodyBase64: buf.toString('base64'),
+              }),
+            };
+          }
+        }
+      } catch {
+        // Fall through to original upstream response
+      }
+    }
+
     const responseHeaders = {};
     for (const [key, val] of Object.entries(response.headers || {})) {
       if (val === undefined) continue;

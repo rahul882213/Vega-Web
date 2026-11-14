@@ -326,12 +326,13 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy, /.netlify/functions/proxy, and remote Netlify backend)
+  // 2. Try backend proxy (/api/proxy, /api/edge-proxy, /.netlify/functions/proxy, and remote Netlify backend)
   const isStaticHost = isStaticOrGitHubPagesHost();
   const remoteBackend = settingsStorage.getRemoteBackendUrl();
 
   const proxyEndpoints = isStaticHost
     ? [
+        `${remoteBackend}/api/edge-proxy`,
         `${remoteBackend}/api/proxy`,
         `${remoteBackend}/.netlify/functions/proxy`,
         '/api/proxy',
@@ -339,7 +340,9 @@ export async function proxyFetch(
       ]
     : [
         '/api/proxy',
+        '/api/edge-proxy',
         '/.netlify/functions/proxy',
+        `${remoteBackend}/api/edge-proxy`,
         `${remoteBackend}/api/proxy`,
         `${remoteBackend}/.netlify/functions/proxy`,
       ];
@@ -387,7 +390,7 @@ export async function proxyFetch(
             bodyText,
           };
 
-          // If Cloudflare/WAF returned 403, 429, or 503 on this proxy node, try the next proxy region
+          // If Cloudflare/WAF returned 403, 429, or 503 on this proxy node, try the next proxy region or CORS relay
           if (
             data.status === 403 ||
             data.status === 429 ||
@@ -403,10 +406,6 @@ export async function proxyFetch(
     } catch {
       // Try next endpoint or fallback
     }
-  }
-
-  if (blockedResult) {
-    return blockedResult;
   }
 
   // 3. Fallback A: Direct browser fetch (works when target server sends Access-Control-Allow-Origin)
@@ -429,40 +428,78 @@ export async function proxyFetch(
       cache: 'no-store',
       signal: init?.signal,
     });
-    return await responseToProxyResult(directRes, url);
+    if (
+      directRes.status !== 403 &&
+      directRes.status !== 429 &&
+      directRes.status !== 503
+    ) {
+      return await responseToProxyResult(directRes, url);
+    }
   } catch {
     // Target blocked direct browser CORS; continue to public CORS proxies
   }
 
-  // 4. Fallback B: Public CORS Proxies for static hosting environments
-  const publicCorsProxies: string[] = [
-    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  ];
-  if (method === 'GET') {
-    publicCorsProxies.push(
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    );
-  }
-
+  // 4. Fallback B: Public CORS Proxies (unblocks Cloudflare AWS-IP 403 challenges on GET)
   let lastError: Error | null = null;
-  for (const corsProxyUrl of publicCorsProxies) {
+  if (method === 'GET') {
     try {
-      const corsRes = await fetch(corsProxyUrl, {
-        method,
-        headers:
-          Object.keys(safeBrowserHeaders).length > 0
-            ? safeBrowserHeaders
-            : undefined,
-        body: directBody,
-        signal: init?.signal,
-      });
-      if (corsRes.ok || (corsRes.status >= 200 && corsRes.status < 500)) {
-        return await responseToProxyResult(corsRes, url);
+      const allOriginsGetUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+      const aoRes = await fetch(allOriginsGetUrl, {signal: init?.signal});
+      if (aoRes.ok) {
+        const aoJson = await aoRes.json();
+        const contents: unknown = aoJson?.contents;
+        const httpCode = Number(aoJson?.status?.http_code || 0);
+        if (
+          typeof contents === 'string' &&
+          contents.length > 0 &&
+          httpCode >= 200 &&
+          httpCode < 400 &&
+          !contents.includes('<title>Just a moment...</title>')
+        ) {
+          const encoded = new TextEncoder().encode(contents);
+          return {
+            status: httpCode,
+            statusText: 'OK',
+            url: String(aoJson?.status?.url || url),
+            headers: {
+              'content-type': String(
+                aoJson?.status?.content_type || 'text/html; charset=utf-8',
+              ),
+            },
+            bodyBytes: encoded,
+            bodyText: contents,
+          };
+        }
       }
     } catch (err: any) {
       lastError = err instanceof Error ? err : new Error(String(err));
     }
+
+    const rawCorsProxies: string[] = [
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    ];
+
+    for (const corsProxyUrl of rawCorsProxies) {
+      try {
+        const corsRes = await fetch(corsProxyUrl, {
+          method: 'GET',
+          signal: init?.signal,
+        });
+        if (corsRes.ok || corsRes.status === 404) {
+          const result = await responseToProxyResult(corsRes, url);
+          if (!result.bodyText.includes('<title>Just a moment...</title>')) {
+            return result;
+          }
+        }
+      } catch (err: any) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+  }
+
+  if (blockedResult) {
+    return blockedResult;
   }
 
   throw (

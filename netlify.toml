@@ -6,6 +6,10 @@
 [functions]
   node_bundler = "esbuild"
 
+[[edge_functions]]
+  path = "/api/edge-proxy"
+  function = "edge-proxy"
+
 [[redirects]]
   from = "/api/proxy"
   to = "/.netlify/functions/proxy"

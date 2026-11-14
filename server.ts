@@ -319,6 +319,46 @@ async function startServer() {
         httpsAgent,
       });
 
+      const upperMethod = String(method).toUpperCase();
+      if (
+        upperMethod === 'GET' &&
+        (response.status === 403 ||
+          response.status === 429 ||
+          response.status === 503)
+      ) {
+        try {
+          const aoRes = await axios.get(
+            `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+            {timeout: 14000, validateStatus: () => true},
+          );
+          const contents = aoRes.data?.contents;
+          const httpCode = Number(aoRes.data?.status?.http_code || 0);
+          if (
+            aoRes.status === 200 &&
+            typeof contents === 'string' &&
+            contents.length > 0 &&
+            httpCode >= 200 &&
+            httpCode < 400 &&
+            !contents.includes('<title>Just a moment...</title>')
+          ) {
+            res.json({
+              status: httpCode,
+              statusText: 'OK',
+              url: aoRes.data?.status?.url || url,
+              headers: {
+                'content-type':
+                  aoRes.data?.status?.content_type ||
+                  'text/html; charset=utf-8',
+              },
+              bodyBase64: Buffer.from(contents, 'utf8').toString('base64'),
+            });
+            return;
+          }
+        } catch {
+          // Return original response
+        }
+      }
+
       const responseHeaders: Record<string, string> = {};
       for (const [key, val] of Object.entries(response.headers)) {
         if (val === undefined) continue;

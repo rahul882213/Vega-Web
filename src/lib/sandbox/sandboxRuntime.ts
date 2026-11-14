@@ -5,7 +5,7 @@ import axios, {
   type InternalAxiosRequestConfig,
 } from 'axios';
 import * as cheerio from 'cheerio';
-import {getBaseUrl} from '../providers/getBaseUrl';
+import {getBaseUrl, getEnrichedUrlsMap} from '../providers/getBaseUrl';
 import {
   providerKvStorage,
   providerCookieStorage,
@@ -152,6 +152,7 @@ export function storeSetCookieForUrl(
     const parsed = new URL(targetUrl);
     const defaultDomain = parsed.hostname.toLowerCase();
     const jar = getCookieJar(author);
+    let changed = false;
     const lines = setCookieRaw.split(/\r?\n/);
     for (const line of lines) {
       const parts = line.split(';').map(p => p.trim());
@@ -168,9 +169,22 @@ export function storeSetCookieForUrl(
         }
       }
       if (!jar[domain]) jar[domain] = {};
-      jar[domain][name] = val;
+      if (jar[domain][name] !== val) {
+        jar[domain][name] = val;
+        changed = true;
+      }
+      const domainKeys = Object.keys(jar[domain]);
+      if (domainKeys.length > 20) {
+        delete jar[domain][domainKeys[0]];
+      }
     }
-    saveCookieJar(author, jar);
+    if (changed) {
+      const domains = Object.keys(jar);
+      if (domains.length > 25) {
+        delete jar[domains[0]];
+      }
+      saveCookieJar(author, jar);
+    }
   } catch {
     // Ignore invalid URL
   }
@@ -312,6 +326,27 @@ export async function proxyFetch(
 
   // 1. Fast path for CORS-enabled public hosts (GitHub Raw, JSDelivr, GitHub Pages, TMDB, Cinemeta)
   if (method === 'GET' && isCorsSafeDirectHost(url) && !storedCookie) {
+    // Serve deduplicated & dynamically portal-resolved urls.json for vega-providers
+    if (url.includes('vega-providers') && url.endsWith('/urls.json')) {
+      try {
+        const enrichedMap = await getEnrichedUrlsMap();
+        if (enrichedMap && Object.keys(enrichedMap).length > 0) {
+          const patchedText = JSON.stringify(enrichedMap);
+          const patchedBytes = new TextEncoder().encode(patchedText);
+          return {
+            status: 200,
+            statusText: 'OK',
+            url,
+            headers: {'content-type': 'application/json; charset=utf-8'},
+            bodyBytes: patchedBytes,
+            bodyText: patchedText,
+          };
+        }
+      } catch {
+        // Fall through to normal direct fetch if enrichment failed
+      }
+    }
+
     try {
       const cleanHeaders = buildBrowserSafeHeaders(headers, true);
       const directRes = await fetch(url, {
@@ -322,73 +357,7 @@ export async function proxyFetch(
         signal: withTimeoutSignal(init?.signal, 10000),
       });
       if (directRes.ok || directRes.status === 404) {
-        const result = await responseToProxyResult(directRes, url);
-        // Enrich Zenda-Cross urls.json with live mirrors for stale/portal/CF-blocked hosts
-        if (
-          result.status === 200 &&
-          url.includes('vega-providers') &&
-          url.endsWith('/urls.json')
-        ) {
-          try {
-            const zendaMap = JSON.parse(result.bodyText);
-            const punisherRes = await fetch(
-              'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json',
-              {cache: 'no-store', signal: withTimeoutSignal(init?.signal, 7000)},
-            ).catch(() => null);
-            const punisherMap =
-              punisherRes && punisherRes.ok
-                ? await punisherRes.json().catch(() => ({}))
-                : {};
-            if (zendaMap && typeof zendaMap === 'object') {
-              const staleHosts = [
-                'one.cinevood.business',
-                'moviesleech.club',
-                'world4ufree.vu',
-                'world4ufree.beer',
-                'ex5wfv.movielinkbd.li',
-              ];
-              const verifiedMirrors: Record<string, {name: string; url: string}> = {
-                w4u: {name: 'world4ufree', url: 'https://new2.world4ufree.watch'},
-                movielinkbd: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
-                movielinkdb: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
-              };
-              const merged: Record<string, any> = {
-                ...(punisherMap && typeof punisherMap === 'object' ? punisherMap : {}),
-                ...zendaMap,
-                ...verifiedMirrors,
-              };
-              for (const [k, entry] of Object.entries(merged)) {
-                const rawU = String((entry as any)?.url || '').toLowerCase();
-                if (staleHosts.some(bad => rawU.includes(bad))) {
-                  const alt =
-                    verifiedMirrors[k] ||
-                    punisherMap[k] ||
-                    Object.entries(punisherMap).find(
-                      ([pk]) => pk.toLowerCase() === k.toLowerCase(),
-                    )?.[1];
-                  if (
-                    (alt as any)?.url &&
-                    !staleHosts.some(b =>
-                      String((alt as any).url).toLowerCase().includes(b),
-                    )
-                  ) {
-                    merged[k] = alt;
-                  }
-                }
-              }
-              const patchedText = JSON.stringify(merged);
-              const patchedBytes = new TextEncoder().encode(patchedText);
-              return {
-                ...result,
-                bodyText: patchedText,
-                bodyBytes: patchedBytes,
-              };
-            }
-          } catch {
-            // Return unpatched urls.json if enrichment fails
-          }
-        }
-        return result;
+        return await responseToProxyResult(directRes, url);
       }
     } catch {
       // Fall through to proxy endpoints if direct fetch is blocked
@@ -410,20 +379,16 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy, /api/edge-proxy, and remote Netlify backend)
+  // 2. Try backend proxy (/api/proxy and remote Netlify backend)
   const isStaticHost = isStaticOrGitHubPagesHost();
   const remoteBackend = settingsStorage.getRemoteBackendUrl();
 
   const proxyEndpoints = isStaticHost
-    ? [
-        ...(edgeProxyUnsupported ? [] : [`${remoteBackend}/api/edge-proxy`]),
-        `${remoteBackend}/api/proxy`,
-      ]
+    ? [`${remoteBackend}/api/proxy`]
     : [
         '/api/proxy',
         ...(edgeProxyUnsupported ? [] : ['/api/edge-proxy']),
         '/.netlify/functions/proxy',
-        ...(edgeProxyUnsupported ? [] : [`${remoteBackend}/api/edge-proxy`]),
         `${remoteBackend}/api/proxy`,
       ];
 
@@ -442,7 +407,7 @@ export async function proxyFetch(
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: proxyPayload,
-        signal: withTimeoutSignal(init?.signal, 12000),
+        signal: withTimeoutSignal(init?.signal, 22000),
       });
 
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -496,6 +461,9 @@ export async function proxyFetch(
         }
       }
     } catch {
+      if (endpoint.endsWith('/api/edge-proxy')) {
+        edgeProxyUnsupported = true;
+      }
       // Try next endpoint or fallback
     }
   }
@@ -518,7 +486,7 @@ export async function proxyFetch(
           : undefined,
       body: directBody,
       cache: 'no-store',
-      signal: withTimeoutSignal(init?.signal, 7000),
+      signal: withTimeoutSignal(init?.signal, 5000),
     });
     if (
       directRes.status !== 403 &&
@@ -531,64 +499,69 @@ export async function proxyFetch(
     // Target blocked direct browser CORS; continue to public CORS proxies
   }
 
-  // 4. Fallback B: Public CORS Proxies (unblocks Cloudflare AWS-IP 403 challenges on GET)
+  // 4. Fallback B: Parallel CORS Relays with tight 6s cap (avoids 24s+ sequential stalls on hard 403s)
   let lastError: Error | null = null;
   if (method === 'GET') {
-    try {
-      const allOriginsGetUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-      const aoRes = await fetch(allOriginsGetUrl, {
-        signal: withTimeoutSignal(init?.signal, 8000),
+    const relaySig = withTimeoutSignal(init?.signal, 6000);
+    const tryAllOriginsJson = async () => {
+      const aoRes = await fetch(
+        `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+        {signal: relaySig},
+      );
+      if (!aoRes.ok) throw new Error(`AllOrigins HTTP ${aoRes.status}`);
+      const aoJson = await aoRes.json();
+      const contents: unknown = aoJson?.contents;
+      const httpCode = Number(aoJson?.status?.http_code || 0);
+      if (
+        typeof contents === 'string' &&
+        contents.length > 0 &&
+        httpCode >= 200 &&
+        httpCode < 400 &&
+        !contents.includes('<title>Just a moment...</title>')
+      ) {
+        const encoded = new TextEncoder().encode(contents);
+        return {
+          status: httpCode,
+          statusText: 'OK',
+          url: String(aoJson?.status?.url || url),
+          headers: {
+            'content-type': String(
+              aoJson?.status?.content_type || 'text/html; charset=utf-8',
+            ),
+          },
+          bodyBytes: encoded,
+          bodyText: contents,
+        };
+      }
+      throw new Error('AllOrigins blocked/empty');
+    };
+
+    const tryRawCorsProxy = async (corsProxyUrl: string) => {
+      const corsRes = await fetch(corsProxyUrl, {
+        method: 'GET',
+        signal: relaySig,
       });
-      if (aoRes.ok) {
-        const aoJson = await aoRes.json();
-        const contents: unknown = aoJson?.contents;
-        const httpCode = Number(aoJson?.status?.http_code || 0);
-        if (
-          typeof contents === 'string' &&
-          contents.length > 0 &&
-          httpCode >= 200 &&
-          httpCode < 400 &&
-          !contents.includes('<title>Just a moment...</title>')
-        ) {
-          const encoded = new TextEncoder().encode(contents);
-          return {
-            status: httpCode,
-            statusText: 'OK',
-            url: String(aoJson?.status?.url || url),
-            headers: {
-              'content-type': String(
-                aoJson?.status?.content_type || 'text/html; charset=utf-8',
-              ),
-            },
-            bodyBytes: encoded,
-            bodyText: contents,
-          };
+      if (corsRes.ok || corsRes.status === 404) {
+        const result = await responseToProxyResult(corsRes, url);
+        if (!result.bodyText.includes('<title>Just a moment...</title>')) {
+          return result;
         }
       }
+      throw new Error(`CORS relay failed (${corsRes.status})`);
+    };
+
+    try {
+      return await Promise.any([
+        tryAllOriginsJson(),
+        tryRawCorsProxy(
+          `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+        ),
+        tryRawCorsProxy(
+          `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+        ),
+      ]);
     } catch (err: any) {
       lastError = err instanceof Error ? err : new Error(String(err));
-    }
-
-    const rawCorsProxies: string[] = [
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    ];
-
-    for (const corsProxyUrl of rawCorsProxies) {
-      try {
-        const corsRes = await fetch(corsProxyUrl, {
-          method: 'GET',
-          signal: withTimeoutSignal(init?.signal, 8000),
-        });
-        if (corsRes.ok || corsRes.status === 404) {
-          const result = await responseToProxyResult(corsRes, url);
-          if (!result.bodyText.includes('<title>Just a moment...</title>')) {
-            return result;
-          }
-        }
-      } catch (err: any) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-      }
     }
   }
 

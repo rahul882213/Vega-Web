@@ -44,9 +44,17 @@ async function resolvePortalUrl(portalUrl, pattern, fallbackUrl) {
       validateStatus: s => s >= 200 && s < 400,
     });
     const html = typeof resp.data === 'string' ? resp.data : '';
-    const match = html.match(pattern);
-    if (match?.[0]) {
-      return match[0].replace(/\/+$/, '');
+    const portalBase = portalUrl.replace(/\/+$/, '').toLowerCase();
+    const matches = html.match(new RegExp(pattern.source, 'gi')) || [];
+    const liveMatch = matches.find(m => {
+      const clean = m.replace(/\/+$/, '').toLowerCase();
+      return (
+        clean !== portalBase &&
+        !STALE_URL_HOSTS.some(bad => clean.includes(bad))
+      );
+    });
+    if (liveMatch) {
+      return liveMatch.replace(/\/+$/, '');
     }
   } catch {
     // Fallback to verified live mirror

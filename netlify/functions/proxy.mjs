@@ -104,10 +104,10 @@ export async function handler(event) {
       rawPreview.includes('Attention Required! | Cloudflare');
 
     if (upperMethod === 'GET' && isCfChallenge) {
-      try {
+      const tryAllOrigins = async () => {
         const aoRes = await axios.get(
           `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-          {timeout: 14000, validateStatus: () => true},
+          {timeout: 7000, validateStatus: () => true},
         );
         const contents = aoRes.data?.contents;
         const httpCode = Number(aoRes.data?.status?.http_code || 0);
@@ -135,16 +135,15 @@ export async function handler(event) {
             }),
           };
         }
-      } catch {
-        // Continue to next relay
-      }
+        throw new Error('AllOrigins relay blocked');
+      };
 
-      try {
+      const tryCodetabs = async () => {
         const ctRes = await axios.get(
           `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
           {
             responseType: 'arraybuffer',
-            timeout: 12000,
+            timeout: 7000,
             validateStatus: () => true,
           },
         );
@@ -171,6 +170,11 @@ export async function handler(event) {
             };
           }
         }
+        throw new Error('Codetabs relay blocked');
+      };
+
+      try {
+        return await Promise.any([tryAllOrigins(), tryCodetabs()]);
       } catch {
         // Fall through to original upstream response
       }

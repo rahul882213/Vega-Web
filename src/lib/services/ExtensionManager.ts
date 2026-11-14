@@ -5,6 +5,7 @@ import {
   ProviderSource,
 } from '../storage/extensionStorage';
 import {sourceTokenStorage} from '../storage/sourceTokenStorage';
+import {settingsStorage} from '../storage/SettingsStorage';
 import {validateProviderModule} from './providerVersion';
 import {proxyFetch} from '../sandbox/sandboxRuntime';
 
@@ -476,6 +477,51 @@ export class ExtensionManager {
       }
     }
     return extensionStorage.getProvidersNeedingUpdate(sourceAuthor);
+  }
+
+  async autoUpdateInstalledProviders(): Promise<boolean> {
+    if (!settingsStorage.isProviderAutoUpdateEnabled()) {
+      return false;
+    }
+
+    const sources = extensionStorage.getProviderSources();
+    for (const source of sources) {
+      if (extensionStorage.shouldRefreshManifest(source.author)) {
+        try {
+          await this.fetchManifest(source, true);
+        } catch {
+          // Ignore network errors during background manifest refresh
+        }
+      }
+    }
+
+    const outdated = extensionStorage.getProvidersNeedingUpdate();
+    if (outdated.length === 0) {
+      return false;
+    }
+
+    let updatedAny = false;
+    let nextIdx = 0;
+    const concurrency = Math.min(4, outdated.length);
+
+    await Promise.all(
+      Array.from({length: concurrency}, async () => {
+        while (nextIdx < outdated.length) {
+          const installedItem = outdated[nextIdx++];
+          const availableList = extensionStorage.getAvailableProviders(
+            installedItem.source?.author,
+          );
+          const latest = availableList.find(
+            a => a.value === installedItem.value,
+          );
+          if (!latest) continue;
+          const ok = await this.updateProvider(latest);
+          if (ok) updatedAny = true;
+        }
+      }),
+    );
+
+    return updatedAny;
   }
 }
 

@@ -43,6 +43,7 @@ export const SearchResults: React.FC<{
       controllersRef.current[item.value]?.abort();
       const controller = new AbortController();
       controllersRef.current[item.value] = controller;
+      const timeoutId = window.setTimeout(() => controller.abort(), 24000);
 
       setResultsByProvider(prev => ({
         ...prev,
@@ -61,6 +62,7 @@ export const SearchResults: React.FC<{
           sourceAuthor: item.source?.author,
           signal: controller.signal,
         });
+        window.clearTimeout(timeoutId);
         if (controller.signal.aborted) return;
         setResultsByProvider(prev => ({
           ...prev,
@@ -71,7 +73,8 @@ export const SearchResults: React.FC<{
           },
         }));
       } catch {
-        if (controller.signal.aborted) return;
+        window.clearTimeout(timeoutId);
+        if (controllersRef.current[item.value] !== controller) return;
         setResultsByProvider(prev => ({
           ...prev,
           [item.value]: {
@@ -91,7 +94,7 @@ export const SearchResults: React.FC<{
     if (orderedProviders.length === 0) return;
 
     let cancelled = false;
-    const concurrency = 5;
+    const concurrency = 6;
     let nextIdx = 0;
 
     const workers = Array.from(
@@ -184,6 +187,22 @@ export const SearchResults: React.FC<{
 
       {/* Results List */}
       <div className="pt-2 space-y-2">
+        {erroredProviders.length > 0 && (
+          <div className="px-4 pt-1 pb-2 flex items-center gap-2">
+            <button
+              onClick={() =>
+                erroredProviders.forEach(p => runProviderSearch(p))
+              }
+              className="px-4 py-2 rounded-full flex items-center gap-2 text-xs font-semibold cursor-pointer"
+              style={{
+                backgroundColor: colors.surfaceContainerHigh,
+                color: colors.onSurface,
+              }}>
+              <RefreshCw size={13} />
+              <span>Retry failed ({erroredProviders.length})</span>
+            </button>
+          </div>
+        )}
         {orderedProviders.length === 0 ? (
           <div className="py-16 text-center px-6">
             <p className="text-sm" style={{color: colors.onSurfaceVariant}}>

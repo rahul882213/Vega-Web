@@ -71,6 +71,16 @@ const VegaShell: React.FC = () => {
           }
         }
         setAvailableProviders(mergedAvailable);
+
+        // Background auto-update for outdated installed provider modules
+        extensionManager
+          .autoUpdateInstalledProviders()
+          .then(updated => {
+            if (updated) {
+              setInstalledProviders(extensionStorage.getInstalledProviders());
+            }
+          })
+          .catch(() => {});
       } catch (error) {
         console.error('Failed to initialize Vega extensions:', error);
       }

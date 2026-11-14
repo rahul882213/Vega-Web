@@ -88,37 +88,59 @@ export const SearchResults: React.FC<{
   useEffect(() => {
     setResultsByProvider({});
     setShowEmpty(false);
-    orderedProviders.forEach(p => {
-      runProviderSearch(p);
-    });
+    if (orderedProviders.length === 0) return;
+
+    let cancelled = false;
+    const concurrency = 5;
+    let nextIdx = 0;
+
+    const workers = Array.from(
+      {length: Math.min(concurrency, orderedProviders.length)},
+      async () => {
+        while (!cancelled && nextIdx < orderedProviders.length) {
+          const item = orderedProviders[nextIdx++];
+          await runProviderSearch(item);
+        }
+      },
+    );
+
+    Promise.all(workers);
+
     return () => {
+      cancelled = true;
       Object.values(controllersRef.current).forEach(c => c.abort());
       controllersRef.current = {};
     };
   }, [orderedProviders, runProviderSearch]);
 
-  const {visibleProviders, emptyProviders, erroredProviders} = useMemo(() => {
-    const visible: ProviderExtension[] = [];
-    const empty: ProviderExtension[] = [];
-    const errored: ProviderExtension[] = [];
+  const {visibleProviders, emptyProviders, erroredProviders, completedCount} =
+    useMemo(() => {
+      const visible: ProviderExtension[] = [];
+      const empty: ProviderExtension[] = [];
+      const errored: ProviderExtension[] = [];
+      let completed = 0;
 
-    for (const item of orderedProviders) {
-      const state = resultsByProvider[item.value];
-      if (!state || state.loading || state.posts.length > 0) {
-        visible.push(item);
-      } else {
-        empty.push(item);
-        if (state.error) {
-          errored.push(item);
+      for (const item of orderedProviders) {
+        const state = resultsByProvider[item.value];
+        if (state && !state.loading) {
+          completed++;
+        }
+        if (!state || state.loading || state.posts.length > 0) {
+          visible.push(item);
+        } else {
+          empty.push(item);
+          if (state.error) {
+            errored.push(item);
+          }
         }
       }
-    }
-    return {
-      visibleProviders: visible,
-      emptyProviders: empty,
-      erroredProviders: errored,
-    };
-  }, [orderedProviders, resultsByProvider]);
+      return {
+        visibleProviders: visible,
+        emptyProviders: empty,
+        erroredProviders: errored,
+        completedCount: completed,
+      };
+    }, [orderedProviders, resultsByProvider]);
 
   const providersToRender = showEmpty
     ? [...visibleProviders, ...emptyProviders]
@@ -146,7 +168,10 @@ export const SearchResults: React.FC<{
             <p
               className="text-[11px] uppercase tracking-wider font-semibold"
               style={{color: colors.onSurfaceVariant}}>
-              Search Results
+              {orderedProviders.length > 0 &&
+              completedCount < orderedProviders.length
+                ? `Searching (${completedCount}/${orderedProviders.length})`
+                : 'Search Results'}
             </p>
             <h1
               className="text-lg font-bold truncate"

@@ -8,10 +8,18 @@ const PUNISHER_MODFLIX_JSON_URL =
 
 const STALE_URL_HOSTS = [
   'one.cinevood.business',
-  'animesalt.in',
+  'animesalt.cx',
   'moviesleech.club',
   'world4ufree.vu',
+  'world4ufree.beer',
+  'ex5wfv.movielinkbd.li',
 ];
+
+const FALLBACK_LIVE_MIRRORS: Record<string, BaseUrlEntry> = {
+  w4u: {name: 'world4ufree', url: 'https://new2.world4ufree.watch'},
+  movielinkbd: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+  movielinkdb: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+};
 
 interface BaseUrlEntry {
   name?: string;
@@ -20,6 +28,12 @@ interface BaseUrlEntry {
 
 let memoryModflixCache: Record<string, BaseUrlEntry> | null = null;
 let memoryModflixFetchedAt = 0;
+
+function isStaleUrl(raw?: string | null): boolean {
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  return STALE_URL_HOSTS.some(bad => lower.includes(bad));
+}
 
 async function fetchModflixDirect(): Promise<Record<string, BaseUrlEntry>> {
   if (
@@ -52,16 +66,21 @@ async function fetchModflixDirect(): Promise<Record<string, BaseUrlEntry>> {
       ? (punisherRes.value as Record<string, BaseUrlEntry>)
       : {};
 
-  const merged: Record<string, BaseUrlEntry> = {...punisherMap, ...zendaMap};
+  const merged: Record<string, BaseUrlEntry> = {
+    ...punisherMap,
+    ...zendaMap,
+    ...FALLBACK_LIVE_MIRRORS,
+  };
   for (const [k, entry] of Object.entries(merged)) {
     const rawUrl = String(entry?.url || '').toLowerCase();
     if (STALE_URL_HOSTS.some(bad => rawUrl.includes(bad))) {
       const alt =
+        FALLBACK_LIVE_MIRRORS[k] ||
         punisherMap[k] ||
         Object.entries(punisherMap).find(
           ([pk]) => pk.toLowerCase() === k.toLowerCase(),
         )?.[1];
-      if (alt?.url) {
+      if (alt?.url && !isStaleUrl(alt.url)) {
         merged[k] = alt;
       }
     }
@@ -83,7 +102,12 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
     const cachedUrl = cacheStorageService.getString(cacheKey);
     const cachedTime = cacheStorageService.getObject<number>(timeKey);
 
-    if (cachedUrl && cachedTime && Date.now() - cachedTime < EXPIRE_TIME) {
+    if (
+      cachedUrl &&
+      !isStaleUrl(cachedUrl) &&
+      cachedTime &&
+      Date.now() - cachedTime < EXPIRE_TIME
+    ) {
       return cachedUrl;
     }
 
@@ -96,7 +120,11 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
-        if (data?.url && typeof data.url === 'string') {
+        if (
+          data?.url &&
+          typeof data.url === 'string' &&
+          !isStaleUrl(data.url)
+        ) {
           cacheStorageService.setString(cacheKey, data.url);
           cacheStorageService.setObject(timeKey, Date.now());
           return data.url;

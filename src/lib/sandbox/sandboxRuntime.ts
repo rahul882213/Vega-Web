@@ -259,6 +259,24 @@ function buildBrowserSafeHeaders(
   return safe;
 }
 
+let edgeProxyUnsupported = false;
+
+function withTimeoutSignal(
+  parent: AbortSignal | undefined,
+  ms: number,
+): AbortSignal {
+  const timeoutSig =
+    typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+      ? AbortSignal.timeout(ms)
+      : undefined;
+  if (!timeoutSig) return parent as AbortSignal;
+  if (!parent) return timeoutSig;
+  if ('any' in AbortSignal) {
+    return (AbortSignal as any).any([parent, timeoutSig]);
+  }
+  return parent;
+}
+
 export async function proxyFetch(
   author: string,
   url: string,
@@ -301,11 +319,11 @@ export async function proxyFetch(
         headers:
           Object.keys(cleanHeaders).length > 0 ? cleanHeaders : undefined,
         cache: 'no-store',
-        signal: init?.signal,
+        signal: withTimeoutSignal(init?.signal, 10000),
       });
       if (directRes.ok || directRes.status === 404) {
         const result = await responseToProxyResult(directRes, url);
-        // Enrich Zenda-Cross urls.json with punisher-303 modflix.json fallbacks for stale/dead hosts
+        // Enrich Zenda-Cross urls.json with live mirrors for stale/portal/CF-blocked hosts
         if (
           result.status === 200 &&
           url.includes('vega-providers') &&
@@ -315,47 +333,56 @@ export async function proxyFetch(
             const zendaMap = JSON.parse(result.bodyText);
             const punisherRes = await fetch(
               'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json',
-              {cache: 'no-store', signal: init?.signal},
-            );
-            if (punisherRes.ok) {
-              const punisherMap = await punisherRes.json();
-              if (
-                zendaMap &&
-                typeof zendaMap === 'object' &&
-                punisherMap &&
-                typeof punisherMap === 'object'
-              ) {
-                const staleHosts = [
-                  'one.cinevood.business',
-                  'animesalt.in',
-                  'moviesleech.club',
-                  'world4ufree.vu',
-                ];
-                const merged: Record<string, any> = {
-                  ...punisherMap,
-                  ...zendaMap,
-                };
-                for (const [k, entry] of Object.entries(merged)) {
-                  const rawU = String((entry as any)?.url || '').toLowerCase();
-                  if (staleHosts.some(bad => rawU.includes(bad))) {
-                    const alt =
-                      punisherMap[k] ||
-                      Object.entries(punisherMap).find(
-                        ([pk]) => pk.toLowerCase() === k.toLowerCase(),
-                      )?.[1];
-                    if ((alt as any)?.url) {
-                      merged[k] = alt;
-                    }
+              {cache: 'no-store', signal: withTimeoutSignal(init?.signal, 7000)},
+            ).catch(() => null);
+            const punisherMap =
+              punisherRes && punisherRes.ok
+                ? await punisherRes.json().catch(() => ({}))
+                : {};
+            if (zendaMap && typeof zendaMap === 'object') {
+              const staleHosts = [
+                'one.cinevood.business',
+                'moviesleech.club',
+                'world4ufree.vu',
+                'world4ufree.beer',
+                'ex5wfv.movielinkbd.li',
+              ];
+              const verifiedMirrors: Record<string, {name: string; url: string}> = {
+                w4u: {name: 'world4ufree', url: 'https://new2.world4ufree.watch'},
+                movielinkbd: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+                movielinkdb: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+              };
+              const merged: Record<string, any> = {
+                ...(punisherMap && typeof punisherMap === 'object' ? punisherMap : {}),
+                ...zendaMap,
+                ...verifiedMirrors,
+              };
+              for (const [k, entry] of Object.entries(merged)) {
+                const rawU = String((entry as any)?.url || '').toLowerCase();
+                if (staleHosts.some(bad => rawU.includes(bad))) {
+                  const alt =
+                    verifiedMirrors[k] ||
+                    punisherMap[k] ||
+                    Object.entries(punisherMap).find(
+                      ([pk]) => pk.toLowerCase() === k.toLowerCase(),
+                    )?.[1];
+                  if (
+                    (alt as any)?.url &&
+                    !staleHosts.some(b =>
+                      String((alt as any).url).toLowerCase().includes(b),
+                    )
+                  ) {
+                    merged[k] = alt;
                   }
                 }
-                const patchedText = JSON.stringify(merged);
-                const patchedBytes = new TextEncoder().encode(patchedText);
-                return {
-                  ...result,
-                  bodyText: patchedText,
-                  bodyBytes: patchedBytes,
-                };
               }
+              const patchedText = JSON.stringify(merged);
+              const patchedBytes = new TextEncoder().encode(patchedText);
+              return {
+                ...result,
+                bodyText: patchedText,
+                bodyBytes: patchedBytes,
+              };
             }
           } catch {
             // Return unpatched urls.json if enrichment fails
@@ -383,25 +410,21 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy, /api/edge-proxy, /.netlify/functions/proxy, and remote Netlify backend)
+  // 2. Try backend proxy (/api/proxy, /api/edge-proxy, and remote Netlify backend)
   const isStaticHost = isStaticOrGitHubPagesHost();
   const remoteBackend = settingsStorage.getRemoteBackendUrl();
 
   const proxyEndpoints = isStaticHost
     ? [
-        `${remoteBackend}/api/edge-proxy`,
+        ...(edgeProxyUnsupported ? [] : [`${remoteBackend}/api/edge-proxy`]),
         `${remoteBackend}/api/proxy`,
-        `${remoteBackend}/.netlify/functions/proxy`,
-        '/api/proxy',
-        '/.netlify/functions/proxy',
       ]
     : [
         '/api/proxy',
-        '/api/edge-proxy',
+        ...(edgeProxyUnsupported ? [] : ['/api/edge-proxy']),
         '/.netlify/functions/proxy',
-        `${remoteBackend}/api/edge-proxy`,
+        ...(edgeProxyUnsupported ? [] : [`${remoteBackend}/api/edge-proxy`]),
         `${remoteBackend}/api/proxy`,
-        `${remoteBackend}/.netlify/functions/proxy`,
       ];
 
   let blockedResult: {
@@ -419,10 +442,18 @@ export async function proxyFetch(
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: proxyPayload,
-        signal: init?.signal,
+        signal: withTimeoutSignal(init?.signal, 12000),
       });
 
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (
+        endpoint.endsWith('/api/edge-proxy') &&
+        (res.status === 404 || !contentType.includes('application/json'))
+      ) {
+        edgeProxyUnsupported = true;
+        continue;
+      }
+
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
         if (data && typeof data.status === 'number') {
@@ -487,7 +518,7 @@ export async function proxyFetch(
           : undefined,
       body: directBody,
       cache: 'no-store',
-      signal: init?.signal,
+      signal: withTimeoutSignal(init?.signal, 7000),
     });
     if (
       directRes.status !== 403 &&
@@ -505,7 +536,9 @@ export async function proxyFetch(
   if (method === 'GET') {
     try {
       const allOriginsGetUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-      const aoRes = await fetch(allOriginsGetUrl, {signal: init?.signal});
+      const aoRes = await fetch(allOriginsGetUrl, {
+        signal: withTimeoutSignal(init?.signal, 8000),
+      });
       if (aoRes.ok) {
         const aoJson = await aoRes.json();
         const contents: unknown = aoJson?.contents;
@@ -545,7 +578,7 @@ export async function proxyFetch(
       try {
         const corsRes = await fetch(corsProxyUrl, {
           method: 'GET',
-          signal: init?.signal,
+          signal: withTimeoutSignal(init?.signal, 8000),
         });
         if (corsRes.ok || corsRes.status === 404) {
           const result = await responseToProxyResult(corsRes, url);

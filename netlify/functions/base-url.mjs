@@ -23,10 +23,36 @@ const PUNISHER_MODFLIX_JSON =
 
 const STALE_URL_HOSTS = [
   'one.cinevood.business',
-  'animesalt.in',
   'moviesleech.club',
   'world4ufree.vu',
+  'world4ufree.beer',
+  'ex5wfv.movielinkbd.li',
 ];
+
+const FALLBACK_LIVE_MIRRORS = {
+  w4u: {name: 'world4ufree', url: 'https://new2.world4ufree.watch'},
+  movielinkbd: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+  movielinkdb: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
+};
+
+async function resolvePortalUrl(portalUrl, pattern, fallbackUrl) {
+  try {
+    const resp = await axios.get(portalUrl, {
+      timeout: 5000,
+      httpsAgent,
+      headers: {'User-Agent': DEFAULT_USER_AGENT},
+      validateStatus: s => s >= 200 && s < 400,
+    });
+    const html = typeof resp.data === 'string' ? resp.data : '';
+    const match = html.match(pattern);
+    if (match?.[0]) {
+      return match[0].replace(/\/+$/, '');
+    }
+  } catch {
+    // Fallback to verified live mirror
+  }
+  return fallbackUrl;
+}
 
 let cachedModflixMap = null;
 let cachedModflixAt = 0;
@@ -37,18 +63,29 @@ async function fetchModflixBaseUrls() {
   if (cachedModflixMap && now - cachedModflixAt < MODFLIX_TTL_MS) {
     return cachedModflixMap;
   }
-  const [zendaRes, punisherRes] = await Promise.allSettled([
-    axios.get(ZENDA_URLS_JSON, {
-      timeout: 10000,
-      httpsAgent,
-      headers: {'User-Agent': DEFAULT_USER_AGENT},
-    }),
-    axios.get(PUNISHER_MODFLIX_JSON, {
-      timeout: 10000,
-      httpsAgent,
-      headers: {'User-Agent': DEFAULT_USER_AGENT},
-    }),
-  ]);
+  const [zendaRes, punisherRes, liveW4uUrl, liveMlbdUrl] =
+    await Promise.allSettled([
+      axios.get(ZENDA_URLS_JSON, {
+        timeout: 10000,
+        httpsAgent,
+        headers: {'User-Agent': DEFAULT_USER_AGENT},
+      }),
+      axios.get(PUNISHER_MODFLIX_JSON, {
+        timeout: 10000,
+        httpsAgent,
+        headers: {'User-Agent': DEFAULT_USER_AGENT},
+      }),
+      resolvePortalUrl(
+        'https://world4ufree.vu/',
+        /https:\/\/[a-z0-9.-]*world4ufree\.[a-z]{2,}/i,
+        FALLBACK_LIVE_MIRRORS.w4u.url,
+      ),
+      resolvePortalUrl(
+        'https://movielinkbd.com/',
+        /https:\/\/[a-z0-9-]+\.movielinkbd\.[a-z]{2,}/i,
+        FALLBACK_LIVE_MIRRORS.movielinkbd.url,
+      ),
+    ]);
 
   const zendaMap =
     zendaRes.status === 'fulfilled' &&
@@ -65,6 +102,19 @@ async function fetchModflixBaseUrls() {
       : {};
 
   const merged = {...punisherMap, ...zendaMap};
+  const resolvedW4u =
+    liveW4uUrl.status === 'fulfilled'
+      ? liveW4uUrl.value
+      : FALLBACK_LIVE_MIRRORS.w4u.url;
+  const resolvedMlbd =
+    liveMlbdUrl.status === 'fulfilled'
+      ? liveMlbdUrl.value
+      : FALLBACK_LIVE_MIRRORS.movielinkbd.url;
+
+  merged.w4u = {name: 'world4ufree', url: resolvedW4u};
+  merged.movielinkbd = {name: 'movielinkbd', url: resolvedMlbd};
+  merged.movielinkdb = {name: 'movielinkbd', url: resolvedMlbd};
+
   for (const [k, entry] of Object.entries(merged)) {
     const rawUrl = String(entry?.url || '').toLowerCase();
     if (STALE_URL_HOSTS.some(bad => rawUrl.includes(bad))) {
@@ -73,8 +123,10 @@ async function fetchModflixBaseUrls() {
         Object.entries(punisherMap).find(
           ([pk]) => pk.toLowerCase() === k.toLowerCase(),
         )?.[1];
-      if (alt?.url) {
+      if (alt?.url && !STALE_URL_HOSTS.some(b => alt.url.toLowerCase().includes(b))) {
         merged[k] = alt;
+      } else if (FALLBACK_LIVE_MIRRORS[k]) {
+        merged[k] = FALLBACK_LIVE_MIRRORS[k];
       }
     }
   }

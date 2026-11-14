@@ -1,5 +1,6 @@
 import React, {useState, useEffect, useRef, useMemo, useCallback} from 'react';
 import Hls from 'hls.js';
+import * as dashjs from 'dashjs';
 import {
   ArrowLeft,
   Play,
@@ -71,7 +72,7 @@ type SleepOption = 'off' | 'episode' | number;
 
 const SLEEP_PRESETS: SleepOption[] = ['off', 15, 30, 45, 60, 90, 'episode'];
 
-const REMOTE_STREAM_BACKEND = 'https://vegawebs.netlify.app';
+let remoteProbeEndpointUnsupported = false;
 
 const LANGUAGE_NAMES: Record<string, string> = {
   en: 'English',
@@ -167,6 +168,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const seekTrackRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const dashRef = useRef<dashjs.MediaPlayerClass | null>(null);
   const subFileInputRef = useRef<HTMLInputElement>(null);
   const localVideoInputRef = useRef<HTMLInputElement>(null);
 
@@ -188,7 +190,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Decoder & Transcode state
+  const remoteBackendBase = settingsStorage.getRemoteBackendUrl();
   const isRemoteTranscodeHost =
     typeof window !== 'undefined' &&
     (window.location.hostname.endsWith('github.io') ||
@@ -196,14 +198,17 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         !window.location.hostname.includes('127.0.0.1') &&
         !window.location.hostname.includes('netlify.app') &&
         !window.location.hostname.endsWith('.run.app')));
-  const [decoderMode, setDecoderMode] = useState<DecoderMode>('hw');
+  const [decoderMode, setDecoderMode] = useState<DecoderMode>('direct');
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
-    null,
+    () => (isRemoteTranscodeHost ? false : null),
   );
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() =>
-    isRemoteTranscodeHost ? REMOTE_STREAM_BACKEND : '',
+    isRemoteTranscodeHost ? remoteBackendBase : '',
   );
-  const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(false);
+  const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(() =>
+    typeof window !== 'undefined' &&
+    window.location.hostname.endsWith('github.io'),
+  );
   const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
   const [probedSubTracks, setProbedSubTracks] = useState<SubtitleTrackItem[]>([]);
@@ -288,6 +293,14 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     );
   }, [selectedStream]);
 
+  const isDashStream = useMemo(() => {
+    const rawLink = selectedStream?.link?.toLowerCase() || '';
+    const typeLower = selectedStream?.type?.toLowerCase() || '';
+    return (
+      typeLower === 'mpd' || typeLower === 'dash' || rawLink.includes('.mpd')
+    );
+  }, [selectedStream]);
+
   const isLocalBlob = useMemo(() => {
     return Boolean(selectedStream?.link?.startsWith('blob:'));
   }, [selectedStream?.link]);
@@ -296,8 +309,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     if (
       isLocalBlob ||
       isHlsStream ||
+      isDashStream ||
       !selectedStream?.link ||
-      transcodeAvailable === false
+      transcodeAvailable !== true
     ) {
       return false;
     }
@@ -305,6 +319,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   }, [
     isLocalBlob,
     isHlsStream,
+    isDashStream,
     selectedStream?.link,
     decoderMode,
     transcodeAvailable,
@@ -354,21 +369,18 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         ? cacheStorage.getObject<number>(`resume_${activeEpisode.link}`) || 0
         : 0;
 
-    const isMkvOrContainer =
+    const isMkvContainer =
       selectedStream?.type?.toLowerCase() === 'mkv' ||
-      rawLink.toLowerCase().includes('.mkv') ||
-      rawLink.toLowerCase().includes('cloudflarestorage') ||
-      rawLink.toLowerCase().includes('pixeldrain') ||
-      rawLink.toLowerCase().includes('gofile') ||
-      rawLink.toLowerCase().includes('hubcdn') ||
-      rawLink.toLowerCase().includes('workers.dev');
+      rawLink.toLowerCase().includes('.mkv');
 
     const initialMode: DecoderMode =
-      transcodeAvailable === false
-        ? 'direct'
-        : isMkvOrContainer
-          ? 'hw'
-          : 'direct';
+      transcodeAvailable === true &&
+      isMkvContainer &&
+      !isHlsStream &&
+      !isDashStream &&
+      !isLocalBlob
+        ? 'hw'
+        : 'direct';
     setDecoderMode(initialMode);
     setTranscodeOffset(
       initialMode !== 'direct' && savedResumePos > 5
@@ -376,7 +388,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         : 0,
     );
 
-    if (!rawLink || rawLink.startsWith('blob:')) return;
+    if (!rawLink || rawLink.startsWith('blob:') || isHlsStream || isDashStream) {
+      return;
+    }
 
     let cancelled = false;
     const params = new URLSearchParams({url: rawLink});
@@ -386,8 +400,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
 
     const probeStreamWithFallback = async () => {
       const candidates = isRemoteTranscodeHost
-        ? [REMOTE_STREAM_BACKEND, '']
-        : ['', REMOTE_STREAM_BACKEND];
+        ? remoteProbeEndpointUnsupported
+          ? []
+          : [remoteBackendBase]
+        : remoteProbeEndpointUnsupported
+          ? ['']
+          : ['', remoteBackendBase];
       for (const base of candidates) {
         try {
           const r = await fetch(`${base}/api/probe-stream?${params.toString()}`);
@@ -397,9 +415,13 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             if (info && !info.error) {
               return {base, info};
             }
+          } else if (base === remoteBackendBase && r.status === 404) {
+            remoteProbeEndpointUnsupported = true;
           }
         } catch {
-          // Try next probe base
+          if (base === remoteBackendBase) {
+            remoteProbeEndpointUnsupported = true;
+          }
         }
       }
       throw new Error('Probe endpoint unavailable');
@@ -461,14 +483,15 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             }),
           );
         }
-        // If probe reveals HEVC / EAC3 / AC3 while in 'direct' mode, switch to 'hw' automatically
+        // Only switch to FFmpeg remux/transcode when codec/container actually requires it
         const hasIncompatibleAudio =
           Array.isArray(info.audioTracks) &&
           info.audioTracks.some((a: any) =>
             /eac3|ac3|dts|truehd|flac/i.test(String(a.codec || '')),
           );
         const isHevc = /hevc|h265|vp9|av1/i.test(String(info.videoCodec || ''));
-        if (hasIncompatibleAudio || isHevc) {
+        const isMkvFormat = String(info.formatName || '').includes('matroska');
+        if (hasIncompatibleAudio || isHevc || isMkvFormat) {
           setDecoderMode(prev => (prev === 'direct' ? (isHevc ? 'sw' : 'hw') : prev));
         }
       })
@@ -482,7 +505,16 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     return () => {
       cancelled = true;
     };
-  }, [selectedStream?.link, selectedStream?.server, encodedStreamHeaders]);
+  }, [
+    selectedStream?.link,
+    selectedStream?.server,
+    encodedStreamHeaders,
+    isHlsStream,
+    isDashStream,
+    isLocalBlob,
+    isRemoteTranscodeHost,
+    remoteBackendBase,
+  ]);
 
   const audioTracks = useMemo<AudioTrackItem[]>(() => {
     if (hlsAudioTracks.length > 0) return hlsAudioTracks;
@@ -500,6 +532,13 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     return [...probedSubTracks, ...ext];
   }, [probedSubTracks, externalSubs]);
 
+  const streamProxyBase =
+    useRemoteProxyFallback ||
+    (typeof window !== 'undefined' &&
+      window.location.hostname.endsWith('github.io'))
+      ? remoteBackendBase
+      : apiBaseUrl || '';
+
   // Build resolved playback URL
   const resolvedVideoUrl = useMemo(() => {
     const rawLink = selectedStream?.link?.trim() || '';
@@ -513,37 +552,33 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       return rawLink;
     }
 
-    // On serverless/static hosts (transcodeAvailable === false), stream large MP4/MKV containers directly from CDN ONLY when no custom headers are required
+    // On serverless/static hosts (transcodeAvailable !== true), stream plain MP4/MKV containers directly from CDN ONLY when no custom headers are required and not HLS/DASH
     if (
-      transcodeAvailable === false &&
+      transcodeAvailable !== true &&
       !isHlsStream &&
-      !encodedStreamHeaders
+      !isDashStream &&
+      !encodedStreamHeaders &&
+      useRawUrlFallback
     ) {
       return rawLink;
     }
 
-    const proxyBase =
-      useRemoteProxyFallback ||
-      (typeof window !== 'undefined' &&
-        window.location.hostname.endsWith('github.io'))
-        ? REMOTE_STREAM_BACKEND
-        : apiBaseUrl || '';
-
     if (
       isHlsStream ||
+      isDashStream ||
       decoderMode === 'direct' ||
-      transcodeAvailable === false
+      transcodeAvailable !== true
     ) {
       const params = new URLSearchParams({url: rawLink});
       if (encodedStreamHeaders) {
         params.set('headers', encodedStreamHeaders);
       }
-      return `${proxyBase}/api/stream-proxy?${params.toString()}`;
+      return `${streamProxyBase}/api/stream-proxy?${params.toString()}`;
     }
 
     // Live FFmpeg Remux ('hw') or Software Transcode ('sw')
     const transcodeBase =
-      apiBaseUrl || (isRemoteTranscodeHost ? REMOTE_STREAM_BACKEND : '');
+      apiBaseUrl || (isRemoteTranscodeHost ? remoteBackendBase : '');
     const params = new URLSearchParams({
       url: rawLink,
       start: String(Math.floor(transcodeOffset)),
@@ -557,17 +592,20 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   }, [
     selectedStream?.link,
     isHlsStream,
+    isDashStream,
     decoderMode,
     transcodeAvailable,
     apiBaseUrl,
-    useRemoteProxyFallback,
+    streamProxyBase,
+    remoteBackendBase,
+    isRemoteTranscodeHost,
     useRawUrlFallback,
     transcodeOffset,
     selectedAudioTrackId,
     encodedStreamHeaders,
   ]);
 
-  // Attach HLS.js or HTML5 Video source
+  // Attach HLS.js, DASH.js, or HTML5 Video source
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !resolvedVideoUrl) return;
@@ -575,6 +613,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
+    }
+    if (dashRef.current) {
+      dashRef.current.reset();
+      dashRef.current = null;
     }
 
     setPlaybackError(null);
@@ -585,7 +627,94 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         ? cacheStorage.getObject<number>(`resume_${activeEpisode.link}`) || 0
         : 0;
 
-    if (isHlsStream && Hls.isSupported()) {
+    if (isDashStream) {
+      const player = dashjs.MediaPlayer().create();
+      dashRef.current = player;
+
+      player.addRequestInterceptor(async request => {
+        if (
+          !request.url ||
+          request.url.startsWith('blob:') ||
+          request.url.includes('/api/stream-proxy')
+        ) {
+          return request;
+        }
+        const params = new URLSearchParams({url: request.url});
+        if (encodedStreamHeaders) {
+          params.set('headers', encodedStreamHeaders);
+        }
+        request.url = `${streamProxyBase}/api/stream-proxy?${params.toString()}`;
+        return request;
+      });
+
+      player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+        const reps = player.getRepresentationsByType('video') || [];
+        const levels: QualityOption[] = [
+          {id: -1, label: 'Auto', detail: 'Adaptive bitrate'},
+          ...reps.map((r, idx) => {
+            const bps = r.bandwidth || (r.bitrateInKbit ? r.bitrateInKbit * 1000 : 0);
+            return {
+              id: idx,
+              label: r.height ? `${r.height}p` : `Level ${idx + 1}`,
+              detail: [
+                bps
+                  ? bps >= 1000000
+                    ? `${(bps / 1000000).toFixed(1)} Mbps`
+                    : `${Math.round(bps / 1000)} kbps`
+                  : null,
+                r.width && r.height ? `${r.width}x${r.height}` : null,
+              ]
+                .filter(Boolean)
+                .join(' · '),
+            };
+          }),
+        ];
+        setQualityOptions(levels);
+
+        const audioList = player.getTracksFor('audio') || [];
+        if (audioList.length > 0) {
+          setHlsAudioTracks(
+            audioList.map((t, idx) => ({
+              id: idx,
+              label: formatLang(
+                t.lang || undefined,
+                t.labels?.[0]?.text || `Audio ${idx + 1}`,
+              ),
+              detail: t.codec || undefined,
+              language: t.lang || undefined,
+              source: 'hls' as const,
+            })),
+          );
+          const currentTrack = player.getCurrentTrackFor('audio');
+          const curIdx = currentTrack
+            ? audioList.findIndex(t => t.index === currentTrack.index)
+            : 0;
+          setSelectedAudioTrackId(curIdx >= 0 ? curIdx : 0);
+        }
+
+        if (savedResumePos > 5) {
+          video.currentTime = savedResumePos;
+        }
+        video.playbackRate = playbackSpeed;
+        video.play().catch(() => {});
+      });
+
+      player.on(dashjs.MediaPlayer.events.ERROR, (ev: any) => {
+        const msg =
+          ev?.error?.message || ev?.error || 'DASH manifest/segment error';
+        if (!useRemoteProxyFallback) {
+          setUseRemoteProxyFallback(true);
+        } else {
+          const switched = switchToNextStream();
+          if (!switched) {
+            setPlaybackError(`DASH Playback Error: ${String(msg)}`);
+            setIsBuffering(false);
+          }
+        }
+      });
+
+      player.initialize(video, resolvedVideoUrl, true);
+    } else if (isHlsStream && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         backBufferLength: 60,
@@ -675,7 +804,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
 
       video.src = resolvedVideoUrl;
       video.onloadedmetadata = () => {
-        if (!isUsingTranscodeEngine && savedResumePos > 5 && savedResumePos < (video.duration || Infinity) - 10) {
+        if (
+          !isUsingTranscodeEngine &&
+          savedResumePos > 5 &&
+          savedResumePos < (video.duration || Infinity) - 10
+        ) {
           video.currentTime = savedResumePos;
         }
         video.playbackRate = playbackSpeed;
@@ -687,6 +820,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+      if (dashRef.current) {
+        dashRef.current.reset();
+        dashRef.current = null;
       }
     };
   }, [resolvedVideoUrl]);
@@ -728,8 +865,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             typeof window !== 'undefined' &&
             window.location.hostname.endsWith('github.io');
           const bases = isGhPages
-            ? [REMOTE_STREAM_BACKEND, '']
-            : ['', REMOTE_STREAM_BACKEND];
+            ? [remoteBackendBase, '']
+            : ['', remoteBackendBase];
           for (const base of bases) {
             try {
               const res = await fetch(
@@ -917,6 +1054,17 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setSelectedQualityId(levelId);
     if (hlsRef.current) {
       hlsRef.current.currentLevel = levelId;
+    } else if (dashRef.current) {
+      if (levelId < 0) {
+        dashRef.current.updateSettings({
+          streaming: {abr: {autoSwitchBitrate: {video: true}}},
+        });
+      } else {
+        dashRef.current.updateSettings({
+          streaming: {abr: {autoSwitchBitrate: {video: false}}},
+        });
+        dashRef.current.setRepresentationForTypeByIndex('video', levelId, true);
+      }
     }
   };
 
@@ -925,6 +1073,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setSelectedAudioTrackId(track.id);
     if (track.source === 'hls' && hlsRef.current) {
       hlsRef.current.audioTrack = track.id;
+    } else if (track.source === 'hls' && dashRef.current) {
+      const audioTracksList = dashRef.current.getTracksFor('audio') || [];
+      if (audioTracksList[track.id]) {
+        dashRef.current.setCurrentTrack(audioTracksList[track.id]);
+      }
     } else {
       // Switch audio track via transcode engine at current position
       if (decoderMode === 'direct') {
@@ -1080,25 +1233,20 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Absolute proxy URL for external players (VLC, MX Player, Outplayer, etc.)
   const absoluteDirectStreamUrl = useMemo(() => {
     if (!selectedStream?.link) return '';
+    const originBase =
+      typeof window !== 'undefined' &&
+      window.location.hostname.endsWith('github.io')
+        ? remoteBackendBase
+        : window.location.origin;
     if (selectedStream.link.startsWith('http')) {
       const hasCustomHeaders = Boolean(encodedStreamHeaders);
       if (!hasCustomHeaders) return selectedStream.link;
-      const originBase =
-        typeof window !== 'undefined' &&
-        window.location.hostname.endsWith('github.io')
-          ? REMOTE_STREAM_BACKEND
-          : window.location.origin;
       return `${originBase}/api/stream-proxy?url=${encodeURIComponent(
         selectedStream.link,
       )}&headers=${encodeURIComponent(encodedStreamHeaders)}`;
     }
-    const originBase =
-      typeof window !== 'undefined' &&
-      window.location.hostname.endsWith('github.io')
-        ? REMOTE_STREAM_BACKEND
-        : window.location.origin;
     return `${originBase}${selectedStream.link}`;
-  }, [selectedStream?.link, encodedStreamHeaders]);
+  }, [selectedStream?.link, encodedStreamHeaders, remoteBackendBase]);
 
   return (
     <div
@@ -1203,10 +1351,6 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         }}
         onError={() => {
           // Automatic decoder & proxy fallback chain:
-          // 1. If in 'direct' via local /api/stream-proxy and it fails, try remote stream proxy (REMOTE_STREAM_BACKEND)
-          // 2. If in 'direct' and transcode is available, try HW Remux -> SW Transcode
-          // 3. If in 'hw' or 'sw' and transcode fails, fall back to 'direct'
-          // 4. If no custom headers are required, try raw direct URL before switching servers
           if (
             decoderMode === 'direct' &&
             !useRemoteProxyFallback &&
@@ -1219,7 +1363,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             decoderMode === 'direct' &&
             transcodeAvailable === true &&
             !isLocalBlob &&
-            !isHlsStream
+            !isHlsStream &&
+            !isDashStream
           ) {
             setTranscodeOffset(Math.floor(currentTime));
             setDecoderMode('hw');
@@ -1230,7 +1375,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             decoderMode === 'hw' &&
             transcodeAvailable === true &&
             !isLocalBlob &&
-            !isHlsStream
+            !isHlsStream &&
+            !isDashStream
           ) {
             setTranscodeOffset(Math.floor(currentTime));
             setDecoderMode('sw');
@@ -2450,7 +2596,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                       href={`${
                         typeof window !== 'undefined' &&
                         window.location.hostname.endsWith('github.io')
-                          ? REMOTE_STREAM_BACKEND
+                          ? remoteBackendBase
                           : ''
                       }/api/stream-proxy?url=${encodeURIComponent(
                         selectedStream.link,

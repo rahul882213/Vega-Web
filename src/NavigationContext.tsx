@@ -34,6 +34,7 @@ export interface PlayerRouteParams {
   };
   file?: string;
   providerValue?: string;
+  sourceAuthor?: string;
   infoUrl?: string;
   imdbId?: string;
   synopsis?: string;

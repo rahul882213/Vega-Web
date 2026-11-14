@@ -78,6 +78,9 @@ const VegaShell: React.FC = () => {
           .then(updated => {
             if (updated) {
               setInstalledProviders(extensionStorage.getInstalledProviders());
+              queryClient.invalidateQueries({queryKey: ['homePageData']});
+              queryClient.invalidateQueries({queryKey: ['contentMeta']});
+              queryClient.invalidateQueries({queryKey: ['stream']});
             }
           })
           .catch(() => {});

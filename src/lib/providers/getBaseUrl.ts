@@ -69,7 +69,7 @@ async function resolvePortalUrlViaProxy(
 ): Promise<string> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(getProxyEndpoint(), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},

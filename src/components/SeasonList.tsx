@@ -223,6 +223,7 @@ export const SeasonList: React.FC<SeasonListProps> = ({
         seasonTitle: activeSeason?.title,
         poster,
         providerValue,
+        sourceAuthor,
         infoUrl,
         imdbId,
         synopsis,

@@ -26,6 +26,7 @@ export const Home: React.FC = () => {
     heroPosts,
     isLoading,
     isRefetching,
+    error,
     refetch,
   } = useHomePageData({
     provider,
@@ -85,15 +86,36 @@ export const Home: React.FC = () => {
       {showContinueWatching && <ContinueWatching />}
 
       <div className="mt-1 space-y-1">
-        {(isLoading ? skeletonCatalog : categories).map((item, index) => (
-          <Slider
-            key={`${item.filter}-${index}`}
-            title={item.title}
-            posts={item.Posts}
-            filter={item.filter}
-            isLoading={isLoading}
-          />
-        ))}
+        {!isLoading && error && categories.length === 0 ? (
+          <div className="px-4 py-10 text-center">
+            <p className="text-sm font-semibold mb-1" style={{color: colors.onSurface}}>
+              Failed to load content from {provider.display_name}
+            </p>
+            <p className="text-xs mb-4" style={{color: colors.onSurfaceVariant}}>
+              {error.message}
+            </p>
+            <button
+              onClick={() => refetch()}
+              className="px-4 py-2 rounded-full text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+              style={{
+                backgroundColor: colors.primary,
+                color: colors.onPrimary,
+              }}>
+              <RefreshCw size={13} />
+              <span>Retry</span>
+            </button>
+          </div>
+        ) : (
+          (isLoading ? skeletonCatalog : categories).map((item, index) => (
+            <Slider
+              key={`${item.filter}-${index}`}
+              title={item.title}
+              posts={item.Posts}
+              filter={item.filter}
+              isLoading={isLoading}
+            />
+          ))
+        )}
       </div>
     </div>
   );

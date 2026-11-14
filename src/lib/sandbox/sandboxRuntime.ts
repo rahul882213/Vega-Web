@@ -387,10 +387,13 @@ export async function proxyFetch(
     ? [`${remoteBackend}/api/proxy`]
     : [
         '/api/proxy',
-        ...(edgeProxyUnsupported ? [] : ['/api/edge-proxy']),
         '/.netlify/functions/proxy',
         `${remoteBackend}/api/proxy`,
       ];
+
+  const edgeEndpoint = isStaticHost
+    ? `${remoteBackend}/api/edge-proxy`
+    : '/api/edge-proxy';
 
   let blockedResult: {
     status: number;
@@ -401,70 +404,87 @@ export async function proxyFetch(
     bodyText: string;
   } | null = null;
 
+  const tryProxyEndpoint = async (endpoint: string) => {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: proxyPayload,
+      signal: withTimeoutSignal(init?.signal, 22000),
+    });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (
+      endpoint.endsWith('/api/edge-proxy') &&
+      (res.status === 404 || !contentType.includes('application/json'))
+    ) {
+      edgeProxyUnsupported = true;
+      return {skip: true as const};
+    }
+
+    if (res.ok && contentType.includes('application/json')) {
+      const data = await res.json();
+      if (data && typeof data.status === 'number') {
+        const responseHeaders: Record<string, string> = data.headers || {};
+        if (responseHeaders['set-cookie']) {
+          storeSetCookieForUrl(
+            author,
+            data.url || url,
+            responseHeaders['set-cookie'],
+          );
+        }
+
+        const bodyBytes = base64ToUint8(data.bodyBase64 || '');
+        const bodyText = decodeBase64ToUtf8(data.bodyBase64 || '');
+
+        const parsedResult = {
+          status: data.status,
+          statusText: data.statusText || '',
+          url: data.url || url,
+          headers: responseHeaders,
+          bodyBytes,
+          bodyText,
+        };
+
+        const isCfBlocked =
+          data.status === 403 ||
+          data.status === 429 ||
+          data.status === 503 ||
+          String(responseHeaders['cf-mitigated'] || '').includes('challenge') ||
+          bodyText.includes('<title>Just a moment...</title>') ||
+          bodyText.includes('Attention Required! | Cloudflare');
+
+        return {skip: false as const, isCfBlocked, parsedResult};
+      }
+    }
+    return {skip: true as const};
+  };
+
   for (const endpoint of proxyEndpoints) {
     try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: proxyPayload,
-        signal: withTimeoutSignal(init?.signal, 22000),
-      });
-
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-      if (
-        endpoint.endsWith('/api/edge-proxy') &&
-        (res.status === 404 || !contentType.includes('application/json'))
-      ) {
-        edgeProxyUnsupported = true;
+      const outcome = await tryProxyEndpoint(endpoint);
+      if (outcome.skip) continue;
+      if (outcome.isCfBlocked) {
+        blockedResult = outcome.parsedResult;
         continue;
       }
+      return outcome.parsedResult;
+    } catch {
+      // Try next endpoint
+    }
+  }
 
-      if (res.ok && contentType.includes('application/json')) {
-        const data = await res.json();
-        if (data && typeof data.status === 'number') {
-          const responseHeaders: Record<string, string> = data.headers || {};
-          if (responseHeaders['set-cookie']) {
-            storeSetCookieForUrl(
-              author,
-              data.url || url,
-              responseHeaders['set-cookie'],
-            );
-          }
-
-          const bodyBytes = base64ToUint8(data.bodyBase64 || '');
-          const bodyText = decodeBase64ToUtf8(data.bodyBase64 || '');
-
-          const parsedResult = {
-            status: data.status,
-            statusText: data.statusText || '',
-            url: data.url || url,
-            headers: responseHeaders,
-            bodyBytes,
-            bodyText,
-          };
-
-          const isCfBlocked =
-            data.status === 403 ||
-            data.status === 429 ||
-            data.status === 503 ||
-            String(responseHeaders['cf-mitigated'] || '').includes('challenge') ||
-            bodyText.includes('<title>Just a moment...</title>') ||
-            bodyText.includes('Attention Required! | Cloudflare');
-
-          // If Cloudflare/WAF blocked this proxy node, try the next proxy region or CORS relay
-          if (isCfBlocked) {
-            blockedResult = parsedResult;
-            continue;
-          }
-
-          return parsedResult;
+  // Fallback to Edge Proxy PoP ONLY if primary proxy failed or hit Cloudflare WAF
+  if (!edgeProxyUnsupported) {
+    try {
+      const edgeOutcome = await tryProxyEndpoint(edgeEndpoint);
+      if (!edgeOutcome.skip) {
+        if (!edgeOutcome.isCfBlocked) {
+          return edgeOutcome.parsedResult;
         }
+        blockedResult = edgeOutcome.parsedResult;
       }
     } catch {
-      if (endpoint.endsWith('/api/edge-proxy')) {
-        edgeProxyUnsupported = true;
-      }
-      // Try next endpoint or fallback
+      edgeProxyUnsupported = true;
     }
   }
 
@@ -633,11 +653,18 @@ function createProviderFetchFunction(author: string) {
       }
     });
 
-    const response = new Response(proxied.bodyBytes as unknown as BodyInit, {
-      status: proxied.status || 200,
-      statusText: proxied.statusText,
-      headers: respHeaders,
-    });
+    const safeStatus =
+      proxied.status >= 200 && proxied.status <= 599 ? proxied.status : 502;
+    const isNullBodyStatus =
+      safeStatus === 204 || safeStatus === 205 || safeStatus === 304;
+    const response = new Response(
+      isNullBodyStatus ? null : (proxied.bodyBytes as unknown as BodyInit),
+      {
+        status: safeStatus,
+        statusText: proxied.statusText,
+        headers: respHeaders,
+      },
+    );
 
     Object.defineProperty(response, 'url', {
       value: proxied.url,

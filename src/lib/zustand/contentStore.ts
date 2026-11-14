@@ -50,7 +50,7 @@ const useContentStore = create<Content>()(
               providers,
               settingsStorage.getProviderOrder(),
             );
-            const activeStillExists = sorted.some(
+            const matchedActive = sorted.find(
               p =>
                 p.value === state.provider.value &&
                 (!state.provider.source?.author ||
@@ -58,9 +58,7 @@ const useContentStore = create<Content>()(
             );
             return {
               installedProviders: sorted,
-              provider: activeStillExists
-                ? state.provider
-                : sorted[0] || EMPTY_PROVIDER,
+              provider: matchedActive || sorted[0] || EMPTY_PROVIDER,
             };
           }),
 

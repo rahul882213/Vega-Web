@@ -73,5 +73,15 @@ export const getHomePageData = async (
   );
 
   await Promise.all(workers);
-  return results.filter(Boolean);
+  const finalResults = results.filter(Boolean);
+  const allEmptyWithErrors =
+    finalResults.length > 0 &&
+    finalResults.every(cat => cat.Posts.length === 0 && Boolean(cat.error));
+  if (allEmptyWithErrors) {
+    throw new Error(
+      finalResults.find(cat => cat.error)?.error ||
+        'Failed to load content from provider',
+    );
+  }
+  return finalResults;
 };

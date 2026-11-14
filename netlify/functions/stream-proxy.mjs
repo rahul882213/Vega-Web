@@ -233,6 +233,9 @@ export async function handler(event) {
     const isLikelyM3u8 =
       lowerUrlPath.endsWith('.m3u8') ||
       targetUrl.toLowerCase().includes('.m3u8');
+    const isLikelyMpd =
+      lowerUrlPath.endsWith('.mpd') ||
+      targetUrl.toLowerCase().includes('.mpd');
     const isTextSubtitle =
       lowerUrlPath.endsWith('.vtt') || lowerUrlPath.endsWith('.srt');
     const isHlsSegment =
@@ -245,7 +248,7 @@ export async function handler(event) {
 
     // For direct MP4/MKV streams (such as MovieBox Web), clamp each HTTP Range request to 2.5 MB
     // so Netlify Functions never exceed serverless payload limits while preserving custom Referer/Origin headers
-    if (!isLikelyM3u8 && !isTextSubtitle && !isHlsSegment) {
+    if (!isLikelyM3u8 && !isLikelyMpd && !isTextSubtitle && !isHlsSegment) {
       outgoingHeaders['Range'] = clampRangeHeader(incomingRange);
     } else if (incomingRange) {
       outgoingHeaders['Range'] = incomingRange;
@@ -317,9 +320,29 @@ export async function handler(event) {
       finalUrl.split('?')[0].toLowerCase().endsWith('.m3u8') ||
       isLikelyM3u8;
 
+    const isMpd =
+      contentType.includes('dash+xml') ||
+      finalUrl.split('?')[0].toLowerCase().endsWith('.mpd') ||
+      isLikelyMpd;
+
     const rawBuffer = Buffer.isBuffer(upstream.data)
       ? upstream.data
       : Buffer.from(upstream.data || []);
+
+    if (
+      upstream.status >= 200 &&
+      upstream.status < 300 &&
+      contentType.includes('text/html') &&
+      !isM3u8 &&
+      !isMpd &&
+      !isTextSubtitle
+    ) {
+      return {
+        statusCode: 415,
+        headers: {'Access-Control-Allow-Origin': '*'},
+        body: 'Upstream returned an HTML webpage instead of a media stream',
+      };
+    }
 
     if (isM3u8 && upstream.status >= 200 && upstream.status < 300) {
       const rawText = rawBuffer.toString('utf8');
@@ -369,7 +392,9 @@ export async function handler(event) {
       );
     }
 
-    if (
+    if (isMpd) {
+      responseHeaders['Content-Type'] = 'application/dash+xml';
+    } else if (
       !contentType ||
       contentType.includes('octet-stream') ||
       contentType.includes('matroska') ||

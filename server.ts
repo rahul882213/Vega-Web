@@ -842,6 +842,32 @@ async function startServer() {
           );
         }
 
+        const contentType = String(respHeaders['content-type'] || '').toLowerCase();
+        const lowerTarget = targetUrl.split('?')[0].toLowerCase();
+        const isTextSub =
+          lowerTarget.endsWith('.vtt') || lowerTarget.endsWith('.srt');
+        const isManifest =
+          lowerTarget.endsWith('.m3u8') ||
+          lowerTarget.endsWith('.mpd') ||
+          contentType.includes('mpegurl') ||
+          contentType.includes('dash+xml');
+
+        if (
+          statusCode >= 200 &&
+          statusCode < 300 &&
+          !isDownload &&
+          !isTextSub &&
+          !isManifest &&
+          contentType.includes('text/html')
+        ) {
+          h2Req.destroy();
+          client.close();
+          res
+            .status(415)
+            .send('Upstream returned an HTML webpage instead of a media stream');
+          return;
+        }
+
         res.status(statusCode);
 
         const forwardHeaders = [
@@ -859,12 +885,13 @@ async function startServer() {
           }
         }
 
-        const contentType = String(respHeaders['content-type'] || '').toLowerCase();
         if (isDownload) {
           res.setHeader(
             'Content-Type',
             String(respHeaders['content-type'] || 'application/octet-stream'),
           );
+        } else if (lowerTarget.endsWith('.mpd') || contentType.includes('dash+xml')) {
+          res.setHeader('Content-Type', 'application/dash+xml');
         } else if (
           !contentType ||
           contentType.includes('octet-stream') ||
@@ -960,11 +987,43 @@ async function startServer() {
         upstream.headers['content-type'] || '',
       ).toLowerCase();
 
+      const lowerFinalPath = finalUrl.split('?')[0].toLowerCase();
+      const lowerTargetPath = targetUrl.split('?')[0].toLowerCase();
+
       const isM3u8 =
         contentType.includes('mpegurl') ||
         contentType.includes('x-mpegurl') ||
-        finalUrl.split('?')[0].toLowerCase().endsWith('.m3u8') ||
-        targetUrl.split('?')[0].toLowerCase().endsWith('.m3u8');
+        lowerFinalPath.endsWith('.m3u8') ||
+        lowerTargetPath.endsWith('.m3u8');
+
+      const isMpd =
+        contentType.includes('dash+xml') ||
+        lowerFinalPath.endsWith('.mpd') ||
+        lowerTargetPath.endsWith('.mpd');
+
+      const isTextSub =
+        lowerFinalPath.endsWith('.vtt') ||
+        lowerFinalPath.endsWith('.srt') ||
+        lowerTargetPath.endsWith('.vtt') ||
+        lowerTargetPath.endsWith('.srt');
+
+      if (
+        upstream.status >= 200 &&
+        upstream.status < 300 &&
+        !isDownload &&
+        !isM3u8 &&
+        !isMpd &&
+        !isTextSub &&
+        contentType.includes('text/html')
+      ) {
+        if (upstream.data && typeof upstream.data.destroy === 'function') {
+          upstream.data.destroy();
+        }
+        res
+          .status(415)
+          .send('Upstream returned an HTML webpage instead of a media stream');
+        return;
+      }
 
       if (isM3u8 && upstream.status >= 200 && upstream.status < 300) {
         const chunks: Buffer[] = [];
@@ -1018,6 +1077,8 @@ async function startServer() {
           'Content-Type',
           String(upstream.headers['content-type'] || 'application/octet-stream'),
         );
+      } else if (isMpd) {
+        res.setHeader('Content-Type', 'application/dash+xml');
       } else {
         if (
           !contentType ||

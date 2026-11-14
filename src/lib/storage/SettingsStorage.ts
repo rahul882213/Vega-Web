@@ -76,8 +76,9 @@ const DEFAULT_PLAYBACK_SPEED = 1.0;
 export const PLAYER_RESIZE_MODES = [
   {mode: 'none', label: 'Fit'},
   {mode: 'cover', label: 'Cover'},
+  {mode: 'zoom', label: 'Zoom'},
   {mode: 'stretch', label: 'Stretch'},
-  {mode: 'contain', label: 'Contain'},
+  {mode: 'contain', label: 'Original'},
 ] as const;
 export type PlayerResizeMode = (typeof PLAYER_RESIZE_MODES)[number]['mode'];
 const DEFAULT_RESIZE_MODE: PlayerResizeMode = 'none';

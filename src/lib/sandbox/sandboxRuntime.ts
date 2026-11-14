@@ -304,7 +304,64 @@ export async function proxyFetch(
         signal: init?.signal,
       });
       if (directRes.ok || directRes.status === 404) {
-        return await responseToProxyResult(directRes, url);
+        const result = await responseToProxyResult(directRes, url);
+        // Enrich Zenda-Cross urls.json with punisher-303 modflix.json fallbacks for stale/dead hosts
+        if (
+          result.status === 200 &&
+          url.includes('vega-providers') &&
+          url.endsWith('/urls.json')
+        ) {
+          try {
+            const zendaMap = JSON.parse(result.bodyText);
+            const punisherRes = await fetch(
+              'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json',
+              {cache: 'no-store', signal: init?.signal},
+            );
+            if (punisherRes.ok) {
+              const punisherMap = await punisherRes.json();
+              if (
+                zendaMap &&
+                typeof zendaMap === 'object' &&
+                punisherMap &&
+                typeof punisherMap === 'object'
+              ) {
+                const staleHosts = [
+                  'one.cinevood.business',
+                  'animesalt.in',
+                  'moviesleech.club',
+                  'world4ufree.vu',
+                ];
+                const merged: Record<string, any> = {
+                  ...punisherMap,
+                  ...zendaMap,
+                };
+                for (const [k, entry] of Object.entries(merged)) {
+                  const rawU = String((entry as any)?.url || '').toLowerCase();
+                  if (staleHosts.some(bad => rawU.includes(bad))) {
+                    const alt =
+                      punisherMap[k] ||
+                      Object.entries(punisherMap).find(
+                        ([pk]) => pk.toLowerCase() === k.toLowerCase(),
+                      )?.[1];
+                    if ((alt as any)?.url) {
+                      merged[k] = alt;
+                    }
+                  }
+                }
+                const patchedText = JSON.stringify(merged);
+                const patchedBytes = new TextEncoder().encode(patchedText);
+                return {
+                  ...result,
+                  bodyText: patchedText,
+                  bodyBytes: patchedBytes,
+                };
+              }
+            }
+          } catch {
+            // Return unpatched urls.json if enrichment fails
+          }
+        }
+        return result;
       }
     } catch {
       // Fall through to proxy endpoints if direct fetch is blocked
@@ -390,12 +447,16 @@ export async function proxyFetch(
             bodyText,
           };
 
-          // If Cloudflare/WAF returned 403, 429, or 503 on this proxy node, try the next proxy region or CORS relay
-          if (
+          const isCfBlocked =
             data.status === 403 ||
             data.status === 429 ||
-            data.status === 503
-          ) {
+            data.status === 503 ||
+            String(responseHeaders['cf-mitigated'] || '').includes('challenge') ||
+            bodyText.includes('<title>Just a moment...</title>') ||
+            bodyText.includes('Attention Required! | Cloudflare');
+
+          // If Cloudflare/WAF blocked this proxy node, try the next proxy region or CORS relay
+          if (isCfBlocked) {
             blockedResult = parsedResult;
             continue;
           }

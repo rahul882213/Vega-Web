@@ -13,43 +13,65 @@ export const getHomePageData = async (
   activeProvider: ProviderExtension,
   signal: AbortSignal,
 ): Promise<HomePageData[]> => {
-  const catalog = providerManager.getCatalog({
+  const catalog = await providerManager.getCatalogAsync({
     providerValue: activeProvider.value,
     sourceAuthor: activeProvider.source?.author,
   });
 
-  const fetchPromises = catalog.map(async item => {
-    try {
-      const data = await providerManager.getPosts({
-        filter: item.filter,
-        page: 1,
-        providerValue: activeProvider.value,
-        sourceAuthor: activeProvider.source?.author,
-        signal,
-      });
+  if (catalog.length === 0 || signal.aborted) {
+    return [];
+  }
 
+  const fetchCategory = async (item: (typeof catalog)[number]): Promise<HomePageData> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
       if (signal.aborted) {
-        return {
-          title: item.title,
-          Posts: [],
-          filter: item.filter,
-        };
+        return {title: item.title, Posts: [], filter: item.filter};
       }
-
-      return {
-        title: item.title,
-        Posts: Array.isArray(data) ? data : [],
-        filter: item.filter,
-      };
-    } catch (error) {
-      return {
-        title: item.title,
-        Posts: [],
-        filter: item.filter,
-        error: error instanceof Error ? error.message : 'Failed to load',
-      };
+      try {
+        const data = await providerManager.getPosts({
+          filter: item.filter,
+          page: 1,
+          providerValue: activeProvider.value,
+          sourceAuthor: activeProvider.source?.author,
+          signal,
+        });
+        const posts = Array.isArray(data) ? data : [];
+        if (posts.length > 0 || attempt === 1) {
+          return {
+            title: item.title,
+            Posts: posts,
+            filter: item.filter,
+          };
+        }
+      } catch (error) {
+        if (attempt === 1) {
+          return {
+            title: item.title,
+            Posts: [],
+            filter: item.filter,
+            error: error instanceof Error ? error.message : 'Failed to load',
+          };
+        }
+      }
+      await new Promise(r => setTimeout(r, 300));
     }
-  });
+    return {title: item.title, Posts: [], filter: item.filter};
+  };
 
-  return Promise.all(fetchPromises);
+  const results: HomePageData[] = new Array(catalog.length);
+  const concurrency = 4;
+  let nextIdx = 0;
+
+  const workers = Array.from(
+    {length: Math.min(concurrency, catalog.length)},
+    async () => {
+      while (nextIdx < catalog.length && !signal.aborted) {
+        const current = nextIdx++;
+        results[current] = await fetchCategory(catalog[current]);
+      }
+    },
+  );
+
+  await Promise.all(workers);
+  return results.filter(Boolean);
 };

@@ -1,7 +1,17 @@
 import {cacheStorageService, getEffectiveApiBaseUrl} from '../storage';
 
 const EXPIRE_TIME = 60 * 60 * 1000;
-const MODFLIX_JSON_URL = 'https://himanshu8443.github.io/providers/modflix.json';
+const ZENDA_URLS_JSON_URL =
+  'https://raw.githubusercontent.com/Zenda-Cross/vega-providers/refs/heads/main/urls.json';
+const PUNISHER_MODFLIX_JSON_URL =
+  'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json';
+
+const STALE_URL_HOSTS = [
+  'one.cinevood.business',
+  'animesalt.in',
+  'moviesleech.club',
+  'world4ufree.vu',
+];
 
 interface BaseUrlEntry {
   name?: string;
@@ -18,14 +28,49 @@ async function fetchModflixDirect(): Promise<Record<string, BaseUrlEntry>> {
   ) {
     return memoryModflixCache;
   }
-  const res = await fetch(MODFLIX_JSON_URL, {cache: 'no-store'});
-  if (res.ok) {
-    const data = await res.json();
-    if (data && typeof data === 'object') {
-      memoryModflixCache = data as Record<string, BaseUrlEntry>;
-      memoryModflixFetchedAt = Date.now();
-      return memoryModflixCache;
+
+  const [zendaRes, punisherRes] = await Promise.allSettled([
+    fetch(ZENDA_URLS_JSON_URL, {cache: 'no-store'}).then(r =>
+      r.ok ? r.json() : null,
+    ),
+    fetch(PUNISHER_MODFLIX_JSON_URL, {cache: 'no-store'}).then(r =>
+      r.ok ? r.json() : null,
+    ),
+  ]);
+
+  const zendaMap: Record<string, BaseUrlEntry> =
+    zendaRes.status === 'fulfilled' &&
+    zendaRes.value &&
+    typeof zendaRes.value === 'object'
+      ? (zendaRes.value as Record<string, BaseUrlEntry>)
+      : {};
+
+  const punisherMap: Record<string, BaseUrlEntry> =
+    punisherRes.status === 'fulfilled' &&
+    punisherRes.value &&
+    typeof punisherRes.value === 'object'
+      ? (punisherRes.value as Record<string, BaseUrlEntry>)
+      : {};
+
+  const merged: Record<string, BaseUrlEntry> = {...punisherMap, ...zendaMap};
+  for (const [k, entry] of Object.entries(merged)) {
+    const rawUrl = String(entry?.url || '').toLowerCase();
+    if (STALE_URL_HOSTS.some(bad => rawUrl.includes(bad))) {
+      const alt =
+        punisherMap[k] ||
+        Object.entries(punisherMap).find(
+          ([pk]) => pk.toLowerCase() === k.toLowerCase(),
+        )?.[1];
+      if (alt?.url) {
+        merged[k] = alt;
+      }
     }
+  }
+
+  if (Object.keys(merged).length > 0) {
+    memoryModflixCache = merged;
+    memoryModflixFetchedAt = Date.now();
+    return merged;
   }
   return memoryModflixCache || {};
 }

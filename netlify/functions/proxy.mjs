@@ -90,14 +90,20 @@ export async function handler(event) {
       httpsAgent,
     });
 
-    // If Cloudflare/WAF blocks AWS Lambda IP (403 / 429 / 503) on GET, relay via public fetch proxies
+    // If Cloudflare/WAF blocks AWS Lambda IP (403 / 429 / 503 or CF challenge HTML) on GET, relay via public fetch proxies
     const upperMethod = String(method).toUpperCase();
-    if (
-      upperMethod === 'GET' &&
-      (response.status === 403 ||
-        response.status === 429 ||
-        response.status === 503)
-    ) {
+    const rawPreview = Buffer.isBuffer(response.data)
+      ? response.data.slice(0, 1024).toString('utf8')
+      : Buffer.from(response.data || []).slice(0, 1024).toString('utf8');
+    const isCfChallenge =
+      response.status === 403 ||
+      response.status === 429 ||
+      response.status === 503 ||
+      String(response.headers?.['cf-mitigated'] || '').includes('challenge') ||
+      rawPreview.includes('<title>Just a moment...</title>') ||
+      rawPreview.includes('Attention Required! | Cloudflare');
+
+    if (upperMethod === 'GET' && isCfChallenge) {
       try {
         const aoRes = await axios.get(
           `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,

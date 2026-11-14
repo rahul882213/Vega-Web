@@ -27,6 +27,18 @@ interface BaseUrlEntry {
   url: string;
 }
 
+const ZENDA_URLS_JSON =
+  'https://raw.githubusercontent.com/Zenda-Cross/vega-providers/refs/heads/main/urls.json';
+const PUNISHER_MODFLIX_JSON =
+  'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json';
+
+const STALE_URL_HOSTS = [
+  'one.cinevood.business',
+  'animesalt.in',
+  'moviesleech.club',
+  'world4ufree.vu',
+];
+
 let cachedModflixMap: Record<string, BaseUrlEntry> | null = null;
 let cachedModflixAt = 0;
 const MODFLIX_TTL_MS = 60 * 60 * 1000;
@@ -36,22 +48,52 @@ async function fetchModflixBaseUrls(): Promise<Record<string, BaseUrlEntry>> {
   if (cachedModflixMap && now - cachedModflixAt < MODFLIX_TTL_MS) {
     return cachedModflixMap;
   }
-  try {
-    const res = await axios.get(
-      'https://himanshu8443.github.io/providers/modflix.json',
-      {
-        timeout: 12000,
-        httpsAgent,
-        headers: {'User-Agent': DEFAULT_USER_AGENT},
-      },
-    );
-    if (res.data && typeof res.data === 'object') {
-      cachedModflixMap = res.data as Record<string, BaseUrlEntry>;
-      cachedModflixAt = now;
-      return cachedModflixMap;
+  const [zendaRes, punisherRes] = await Promise.allSettled([
+    axios.get(ZENDA_URLS_JSON, {
+      timeout: 10000,
+      httpsAgent,
+      headers: {'User-Agent': DEFAULT_USER_AGENT},
+    }),
+    axios.get(PUNISHER_MODFLIX_JSON, {
+      timeout: 10000,
+      httpsAgent,
+      headers: {'User-Agent': DEFAULT_USER_AGENT},
+    }),
+  ]);
+
+  const zendaMap: Record<string, BaseUrlEntry> =
+    zendaRes.status === 'fulfilled' &&
+    zendaRes.value.data &&
+    typeof zendaRes.value.data === 'object'
+      ? (zendaRes.value.data as Record<string, BaseUrlEntry>)
+      : {};
+
+  const punisherMap: Record<string, BaseUrlEntry> =
+    punisherRes.status === 'fulfilled' &&
+    punisherRes.value.data &&
+    typeof punisherRes.value.data === 'object'
+      ? (punisherRes.value.data as Record<string, BaseUrlEntry>)
+      : {};
+
+  const merged: Record<string, BaseUrlEntry> = {...punisherMap, ...zendaMap};
+  for (const [k, entry] of Object.entries(merged)) {
+    const rawUrl = String(entry?.url || '').toLowerCase();
+    if (STALE_URL_HOSTS.some(bad => rawUrl.includes(bad))) {
+      const alt =
+        punisherMap[k] ||
+        Object.entries(punisherMap).find(
+          ([pk]) => pk.toLowerCase() === k.toLowerCase(),
+        )?.[1];
+      if (alt?.url) {
+        merged[k] = alt;
+      }
     }
-  } catch (err) {
-    console.warn('Failed to fetch modflix.json base URLs:', err);
+  }
+
+  if (Object.keys(merged).length > 0) {
+    cachedModflixMap = merged;
+    cachedModflixAt = now;
+    return merged;
   }
   return cachedModflixMap || {};
 }
@@ -320,12 +362,19 @@ async function startServer() {
       });
 
       const upperMethod = String(method).toUpperCase();
-      if (
-        upperMethod === 'GET' &&
-        (response.status === 403 ||
-          response.status === 429 ||
-          response.status === 503)
-      ) {
+      const rawBuf = Buffer.isBuffer(response.data)
+        ? response.data
+        : Buffer.from(response.data || []);
+      const rawPreview = rawBuf.slice(0, 1024).toString('utf8');
+      const isCfChallenge =
+        response.status === 403 ||
+        response.status === 429 ||
+        response.status === 503 ||
+        String(response.headers?.['cf-mitigated'] || '').includes('challenge') ||
+        rawPreview.includes('<title>Just a moment...</title>') ||
+        rawPreview.includes('Attention Required! | Cloudflare');
+
+      if (upperMethod === 'GET' && isCfChallenge) {
         try {
           const aoRes = await axios.get(
             `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
@@ -339,7 +388,8 @@ async function startServer() {
             contents.length > 0 &&
             httpCode >= 200 &&
             httpCode < 400 &&
-            !contents.includes('<title>Just a moment...</title>')
+            !contents.includes('<title>Just a moment...</title>') &&
+            !contents.includes('Attention Required! | Cloudflare')
           ) {
             res.json({
               status: httpCode,
@@ -353,6 +403,42 @@ async function startServer() {
               bodyBase64: Buffer.from(contents, 'utf8').toString('base64'),
             });
             return;
+          }
+        } catch {
+          // Continue to codetabs
+        }
+
+        try {
+          const ctRes = await axios.get(
+            `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+            {
+              responseType: 'arraybuffer',
+              timeout: 12000,
+              validateStatus: () => true,
+            },
+          );
+          if (ctRes.status >= 200 && ctRes.status < 400 && ctRes.data) {
+            const buf = Buffer.isBuffer(ctRes.data)
+              ? ctRes.data
+              : Buffer.from(ctRes.data);
+            const preview = buf.slice(0, 1024).toString('utf8');
+            if (
+              !preview.includes('<title>Just a moment...</title>') &&
+              !preview.includes('Attention Required! | Cloudflare')
+            ) {
+              res.json({
+                status: ctRes.status,
+                statusText: 'OK',
+                url,
+                headers: {
+                  'content-type':
+                    String(ctRes.headers['content-type'] || '') ||
+                    'text/html; charset=utf-8',
+                },
+                bodyBase64: buf.toString('base64'),
+              });
+              return;
+            }
           }
         } catch {
           // Return original response

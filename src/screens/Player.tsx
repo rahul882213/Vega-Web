@@ -208,6 +208,15 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
   const [probedSubTracks, setProbedSubTracks] = useState<SubtitleTrackItem[]>([]);
   const [probedResolution, setProbedResolution] = useState<string>('');
+  const [probedDimensions, setProbedDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  const [probedVideoCodec, setProbedVideoCodec] = useState<string>('');
+  const [videoDimensions, setVideoDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
 
   // Scrubbing preview state
   const [hoverTime, setHoverTime] = useState<number | null>(null);
@@ -329,6 +338,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setProbedAudioTracks([]);
     setProbedSubTracks([]);
     setProbedResolution('');
+    setProbedDimensions(null);
+    setProbedVideoCodec('');
+    setVideoDimensions(null);
     setSelectedAudioTrackId(0);
     setUseRemoteProxyFallback(
       typeof window !== 'undefined' &&
@@ -403,6 +415,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         }
         if (info.height > 0) {
           setProbedResolution(`${info.height}p`);
+          if (info.width > 0) {
+            setProbedDimensions({width: info.width, height: info.height});
+          }
+        }
+        if (info.videoCodec) {
+          setProbedVideoCodec(String(info.videoCodec));
         }
         if (Array.isArray(info.audioTracks) && info.audioTracks.length > 0) {
           setProbedAudioTracks(
@@ -764,6 +782,19 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     return () => clearTimeout(timer);
   }, [showControls, isPlaying, settingsOpen, episodeDrawerOpen]);
 
+  // Close player sheets on Escape key
+  useEffect(() => {
+    if (!settingsOpen && !episodeDrawerOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setSettingsOpen(false);
+        setEpisodeDrawerOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [settingsOpen, episodeDrawerOpen]);
+
   // Countdown Sleep Timer
   useEffect(() => {
     if (typeof sleepOption !== 'number' || sleepOption <= 0) {
@@ -919,7 +950,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     const nextItem = PLAYER_RESIZE_MODES[(idx + 1) % PLAYER_RESIZE_MODES.length];
     setResizeMode(nextItem.mode);
     settingsStorage.setDefaultResizeMode(nextItem.mode);
-    showToast(`Video Fit: ${nextItem.label}`);
+    showToast(`Resize: ${nextItem.label}`);
   };
 
   const handleUploadLocalSubtitle = (
@@ -999,21 +1030,19 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     Boolean(routeParams.linkList) &&
     episodeIndex + 1 < routeParams.linkList.length;
 
-  const objectFitClass =
+  const videoFitClass =
     resizeMode === 'cover'
-      ? 'object-cover'
-      : resizeMode === 'stretch'
-        ? 'object-fill'
-        : 'object-contain';
+      ? 'w-full h-full object-cover transition-transform duration-200'
+      : resizeMode === 'zoom'
+        ? 'w-full h-full object-cover scale-[1.22] transition-transform duration-200'
+        : resizeMode === 'stretch'
+          ? 'w-full h-full object-fill transition-transform duration-200'
+          : resizeMode === 'contain'
+            ? 'w-full h-full object-none transition-transform duration-200'
+            : 'w-full h-full object-contain transition-transform duration-200';
 
   const resizeLabel =
-    resizeMode === 'cover'
-      ? 'Cover'
-      : resizeMode === 'stretch'
-        ? 'Stretch'
-        : resizeMode === 'none'
-          ? 'Fit'
-          : 'Contain';
+    PLAYER_RESIZE_MODES.find(m => m.mode === resizeMode)?.label || 'Fit';
 
   const selectedAudioLabel =
     audioTracks.find(t => t.id === selectedAudioTrackId)?.label || 'Auto';
@@ -1105,8 +1134,14 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       {/* HTML5 Video Element */}
       <video
         ref={videoRef}
-        className={`w-full h-full ${objectFitClass}`}
+        className={videoFitClass}
         playsInline
+        onLoadedMetadata={e => {
+          const v = e.currentTarget;
+          if (v.videoWidth > 0 && v.videoHeight > 0) {
+            setVideoDimensions({width: v.videoWidth, height: v.videoHeight});
+          }
+        }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onWaiting={() => setIsBuffering(true)}
@@ -1811,68 +1846,33 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-4">
           <div
             onClick={e => e.stopPropagation()}
-            className="w-full max-w-2xl rounded-[22px] p-4 border shadow-2xl flex flex-col max-h-[85vh] overflow-hidden"
-            style={{
-              backgroundColor: '#171717',
-              borderColor: '#2e2e2e',
-            }}>
-            {/* Modal Top Tab Strip + Close Button */}
-            <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-white/10">
-              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
-                {(
-                  [
-                    {id: 'server', label: 'Server & Quality'},
-                    {id: 'audio', label: 'Audio'},
-                    {id: 'subtitle', label: 'Subtitle'},
-                    {id: 'speed', label: 'Speed'},
-                    {id: 'sleep', label: 'Sleep Timer'},
-                    {id: 'external', label: 'External Player'},
-                  ] as {id: SettingsTab; label: string}[]
-                ).map(t => {
-                  const active = activeTab === t.id;
-                  return (
-                    <button
-                      key={t.id}
-                      onClick={() => setActiveTab(t.id)}
-                      className="px-3.5 py-1.5 rounded-full text-xs font-bold transition-colors shrink-0 cursor-pointer"
-                      style={{
-                        backgroundColor: active ? '#383838' : '#242424',
-                        color: active ? colors.primary : '#ffffff',
-                      }}>
-                      {t.label}
-                    </button>
-                  );
-                })}
+            className="w-full max-w-2xl rounded-[26px] p-5 sm:p-6 border border-white/15 bg-[#121212] shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
+            {/* Close Button Header for non-server utility sheets */}
+            {activeTab !== 'server' && (
+              <div className="flex items-center justify-end pb-2 mb-1">
+                <button
+                  onClick={() => setSettingsOpen(false)}
+                  className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white shrink-0 cursor-pointer">
+                  <X size={17} />
+                </button>
               </div>
-
-              <button
-                onClick={() => setSettingsOpen(false)}
-                className="w-9 h-9 rounded-full bg-[#292929] hover:bg-[#383838] flex items-center justify-center text-white shrink-0 cursor-pointer">
-                <X size={18} />
-              </button>
-            </div>
+            )}
 
             {/* Tab Content Area */}
-            <div className="flex-1 overflow-y-auto pr-1">
-              {/* TAB 1: SERVER & QUALITY (Exact Vega 2-Column PlayerSourceMenu) */}
+            <div className="flex-1 overflow-y-auto">
+              {/* TAB 1: SERVER & QUALITY (Matches Vega Android App 2-Column Sheet) */}
               {activeTab === 'server' && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 sm:divide-x sm:divide-white/10 gap-5 sm:gap-0">
                   {/* Server Column */}
-                  <div>
-                    <h4 className="text-center text-white text-base font-extrabold mb-2">
+                  <div className="sm:pr-5 flex flex-col">
+                    <h4 className="text-center text-white text-lg font-bold mb-4">
                       Server
                     </h4>
-                    <div className="space-y-1.5">
+                    <div className="space-y-2.5 overflow-y-auto pr-0.5">
                       {streams.map((item, idx) => {
                         const selected =
                           item.link === selectedStream.link &&
                           item.server === selectedStream.server;
-                        const tags = (item.tags || []).filter(
-                          tg =>
-                            tg &&
-                            tg.toLowerCase() !==
-                              String(item.quality || '').toLowerCase(),
-                        );
                         return (
                           <button
                             key={`${idx}:${item.link}`}
@@ -1880,167 +1880,179 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                               setSelectedStream(item);
                               setSettingsOpen(false);
                             }}
-                            className="w-full p-3 rounded-2xl border text-left flex items-center justify-between gap-2 transition-colors cursor-pointer"
-                            style={{
-                              backgroundColor: selected ? '#303030' : '#222222',
-                              borderColor: selected ? colors.primary : '#303030',
-                            }}>
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className="text-sm font-bold truncate"
-                                  style={{
-                                    color: selected ? colors.primary : '#ffffff',
-                                  }}>
-                                  {item.server || `Server ${idx + 1}`}
-                                </span>
-                                {item.quality && (
-                                  <span className="px-1.5 py-0.5 rounded bg-white/10 text-[10px] font-bold text-white shrink-0">
-                                    {item.quality}p
-                                  </span>
-                                )}
-                              </div>
-                              {(tags.length > 0 || item.type) && (
-                                <p className="text-[11px] text-white/60 mt-0.5 truncate">
-                                  {[item.type?.toUpperCase(), ...tags]
-                                    .filter(Boolean)
-                                    .join(' · ')}
-                                </p>
-                              )}
+                            className={`w-full px-4 py-3.5 rounded-2xl text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
+                              selected
+                                ? 'border-[1.5px] border-white bg-[#1a1a1a]'
+                                : 'border border-white/15 bg-[#161616] hover:bg-[#1f1f1f]'
+                            }`}>
+                            <div className="flex items-center gap-3 min-w-0 flex-1">
+                              <Server
+                                size={20}
+                                className="text-white/90 shrink-0"
+                              />
+                              <span className="text-sm font-bold text-white truncate">
+                                {item.server || `Server ${idx + 1}`}
+                              </span>
                             </div>
                             {selected && (
-                              <Check size={16} style={{color: colors.primary}} />
+                              <span className="w-6 h-6 rounded-full bg-white flex items-center justify-center shrink-0">
+                                <Check
+                                  size={14}
+                                  strokeWidth={3}
+                                  className="text-black"
+                                />
+                              </span>
                             )}
                           </button>
                         );
                       })}
-
-                      {/* Local Video Row */}
-                      <div className="pt-2 mt-2 border-t border-white/10">
-                        <button
-                          onClick={() => localVideoInputRef.current?.click()}
-                          className="w-full p-3 rounded-2xl border border-[#303030] bg-[#222222] hover:bg-[#2c2c2c] text-left flex items-center gap-3 cursor-pointer">
-                          <FolderOpen size={18} style={{color: colors.primary}} />
-                          <div>
-                            <p className="text-sm font-bold text-white">
-                              Local video
-                            </p>
-                            <p className="text-[11px] text-white/60">
-                              Choose a file from this device
-                            </p>
-                          </div>
-                        </button>
-                      </div>
                     </div>
+
+                    <div className="border-t border-white/15 my-3.5" />
+
+                    <button
+                      onClick={() => localVideoInputRef.current?.click()}
+                      className="w-full px-4 py-3.5 rounded-2xl border border-white/15 bg-[#161616] hover:bg-[#1f1f1f] text-left flex items-center gap-3.5 transition-colors cursor-pointer">
+                      <FolderOpen
+                        size={20}
+                        className="text-white/85 shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-white leading-snug">
+                          Local video
+                        </p>
+                        <p className="text-xs text-white/55 truncate">
+                          Choose a file from this device
+                        </p>
+                      </div>
+                    </button>
                   </div>
 
-                  {/* Quality & Decoder Column */}
-                  <div className="border-t sm:border-t-0 sm:border-l border-white/10 pt-3 sm:pt-0 sm:pl-4">
-                    <h4 className="text-center text-white text-base font-extrabold mb-2">
-                      Quality & Decoder
+                  {/* Quality Column */}
+                  <div className="border-t sm:border-t-0 border-white/10 pt-5 sm:pt-0 sm:pl-5 flex flex-col">
+                    <h4 className="text-center text-white text-lg font-bold mb-1.5">
+                      Quality
                     </h4>
-                    <div className="space-y-1.5">
-                      {qualityOptions.map(q => {
-                        const selected = selectedQualityId === q.id;
-                        return (
-                          <button
-                            key={q.id}
-                            onClick={() => {
-                              handleSelectQuality(q.id);
-                              setSettingsOpen(false);
-                            }}
-                            className="w-full p-3 rounded-2xl border text-left flex items-center justify-between gap-2 cursor-pointer"
-                            style={{
-                              backgroundColor: selected ? '#303030' : '#222222',
-                              borderColor: selected ? colors.primary : '#303030',
-                            }}>
-                            <div>
-                              <p
-                                className="text-sm font-bold"
-                                style={{
-                                  color: selected ? colors.primary : '#ffffff',
-                                }}>
-                                {q.label}
-                              </p>
-                              {q.detail && (
-                                <p className="text-[11px] text-white/60">
-                                  {q.detail}
-                                </p>
-                              )}
-                            </div>
-                            {selected && (
-                              <Check size={16} style={{color: colors.primary}} />
-                            )}
-                          </button>
-                        );
-                      })}
 
-                      {!isLocalBlob && !isHlsStream && (
-                        <div className="pt-3 mt-3 border-t border-white/10 space-y-1.5">
-                          <p className="text-xs font-bold text-white/70 mb-1">
-                            Stream Decoder Engine
-                          </p>
-                          {(
-                            [
-                              {
-                                id: 'hw',
-                                title: 'HW Remux (Recommended for MKV)',
-                                detail:
-                                  'Lossless video copy + stereo AAC audio via FFmpeg',
-                              },
-                              {
-                                id: 'sw',
-                                title: 'SW Transcode (Maximum Compatibility)',
-                                detail:
-                                  'Converts HEVC / 10-bit video to H.264 + AAC on the fly',
-                              },
-                              {
-                                id: 'direct',
-                                title: 'Direct Stream Proxy',
-                                detail: 'Raw byte-range stream without remuxing',
-                              },
-                            ] as {id: DecoderMode; title: string; detail: string}[]
-                          ).map(dec => {
-                            const active = decoderMode === dec.id;
-                            return (
-                              <button
-                                key={dec.id}
-                                onClick={() => {
-                                  const pos = Math.floor(currentTime);
-                                  setTranscodeOffset(dec.id === 'direct' ? 0 : pos);
-                                  setDecoderMode(dec.id);
-                                  setSettingsOpen(false);
-                                  showToast(`Switched to ${dec.title}`);
-                                }}
-                                className="w-full p-2.5 rounded-2xl border text-left flex items-center justify-between gap-2 cursor-pointer"
-                                style={{
-                                  backgroundColor: active ? '#303030' : '#222222',
-                                  borderColor: active ? colors.primary : '#303030',
-                                }}>
-                                <div>
-                                  <p
-                                    className="text-xs font-bold"
-                                    style={{
-                                      color: active ? colors.primary : '#ffffff',
-                                    }}>
-                                    {dec.title}
+                    {qualityOptions.length <= 1 ? (
+                      (() => {
+                        const activeDims = probedDimensions || videoDimensions;
+                        const numericQuality = Number.parseInt(
+                          String(
+                            activeDims?.height ||
+                              selectedStream.quality ||
+                              probedResolution ||
+                              '',
+                          ),
+                          10,
+                        );
+                        const qualityLabel = activeDims?.height
+                          ? `${activeDims.height}p`
+                          : probedResolution
+                            ? probedResolution
+                            : selectedStream.quality
+                              ? `${selectedStream.quality}p`
+                              : 'Auto';
+                        const badgeText =
+                          Number.isFinite(numericQuality) &&
+                          numericQuality >= 2160
+                            ? '4K'
+                            : Number.isFinite(numericQuality) &&
+                                numericQuality > 0 &&
+                                numericQuality < 720
+                              ? 'SD'
+                              : 'HD';
+                        const dimText = activeDims
+                          ? `${activeDims.width}x${activeDims.height}`
+                          : null;
+                        const codecText =
+                          probedVideoCodec ||
+                          (selectedStream.type
+                            ? selectedStream.type.toUpperCase()
+                            : 'MP4');
+                        const detailLine = [dimText, codecText]
+                          .filter(Boolean)
+                          .join(' · ');
+
+                        return (
+                          <>
+                            <p className="text-xs text-white/55 text-center mb-4">
+                              This stream has a single quality
+                            </p>
+                            <div className="px-4 py-3.5 rounded-2xl border border-white/15 bg-[#161616] flex items-center gap-3.5">
+                              <span className="bg-white text-black text-[11px] font-black px-1.5 py-0.5 rounded leading-tight shrink-0">
+                                {badgeText}
+                              </span>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-bold text-white leading-snug">
+                                  {qualityLabel}
+                                </p>
+                                {detailLine && (
+                                  <p className="text-xs text-white/55 truncate">
+                                    {detailLine}
                                   </p>
-                                  <p className="text-[10px] text-white/60">
-                                    {dec.detail}
-                                  </p>
-                                </div>
-                                {active && (
-                                  <Check
-                                    size={15}
-                                    style={{color: colors.primary}}
-                                  />
                                 )}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
+                              </div>
+                            </div>
+                          </>
+                        );
+                      })()
+                    ) : (
+                      <div className="space-y-2.5 mt-2 overflow-y-auto pr-0.5">
+                        {qualityOptions.map(q => {
+                          const selected = selectedQualityId === q.id;
+                          const numQ = Number.parseInt(q.label, 10);
+                          const badge =
+                            q.id === -1
+                              ? 'AUTO'
+                              : Number.isFinite(numQ) && numQ >= 2160
+                                ? '4K'
+                                : Number.isFinite(numQ) &&
+                                    numQ > 0 &&
+                                    numQ < 720
+                                  ? 'SD'
+                                  : 'HD';
+                          return (
+                            <button
+                              key={q.id}
+                              onClick={() => {
+                                handleSelectQuality(q.id);
+                                setSettingsOpen(false);
+                              }}
+                              className={`w-full px-4 py-3.5 rounded-2xl text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
+                                selected
+                                  ? 'border-[1.5px] border-white bg-[#1a1a1a]'
+                                  : 'border border-white/15 bg-[#161616] hover:bg-[#1f1f1f]'
+                              }`}>
+                              <div className="flex items-center gap-3.5 min-w-0 flex-1">
+                                <span className="bg-white text-black text-[10px] font-black px-1.5 py-0.5 rounded leading-tight shrink-0">
+                                  {badge}
+                                </span>
+                                <div className="min-w-0">
+                                  <p className="text-sm font-bold text-white leading-snug">
+                                    {q.label}
+                                  </p>
+                                  {q.detail && (
+                                    <p className="text-xs text-white/55 truncate">
+                                      {q.detail}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                              {selected && (
+                                <span className="w-6 h-6 rounded-full bg-white flex items-center justify-center shrink-0">
+                                  <Check
+                                    size={14}
+                                    strokeWidth={3}
+                                    className="text-black"
+                                  />
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

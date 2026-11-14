@@ -16,6 +16,18 @@ const CORS_HEADERS = {
   'Content-Type': 'application/json',
 };
 
+const ZENDA_URLS_JSON =
+  'https://raw.githubusercontent.com/Zenda-Cross/vega-providers/refs/heads/main/urls.json';
+const PUNISHER_MODFLIX_JSON =
+  'https://raw.githubusercontent.com/punisher-303/providers/main/modflix.json';
+
+const STALE_URL_HOSTS = [
+  'one.cinevood.business',
+  'animesalt.in',
+  'moviesleech.club',
+  'world4ufree.vu',
+];
+
 let cachedModflixMap = null;
 let cachedModflixAt = 0;
 const MODFLIX_TTL_MS = 60 * 60 * 1000;
@@ -25,22 +37,52 @@ async function fetchModflixBaseUrls() {
   if (cachedModflixMap && now - cachedModflixAt < MODFLIX_TTL_MS) {
     return cachedModflixMap;
   }
-  try {
-    const res = await axios.get(
-      'https://himanshu8443.github.io/providers/modflix.json',
-      {
-        timeout: 12000,
-        httpsAgent,
-        headers: {'User-Agent': DEFAULT_USER_AGENT},
-      },
-    );
-    if (res.data && typeof res.data === 'object') {
-      cachedModflixMap = res.data;
-      cachedModflixAt = now;
-      return cachedModflixMap;
+  const [zendaRes, punisherRes] = await Promise.allSettled([
+    axios.get(ZENDA_URLS_JSON, {
+      timeout: 10000,
+      httpsAgent,
+      headers: {'User-Agent': DEFAULT_USER_AGENT},
+    }),
+    axios.get(PUNISHER_MODFLIX_JSON, {
+      timeout: 10000,
+      httpsAgent,
+      headers: {'User-Agent': DEFAULT_USER_AGENT},
+    }),
+  ]);
+
+  const zendaMap =
+    zendaRes.status === 'fulfilled' &&
+    zendaRes.value.data &&
+    typeof zendaRes.value.data === 'object'
+      ? zendaRes.value.data
+      : {};
+
+  const punisherMap =
+    punisherRes.status === 'fulfilled' &&
+    punisherRes.value.data &&
+    typeof punisherRes.value.data === 'object'
+      ? punisherRes.value.data
+      : {};
+
+  const merged = {...punisherMap, ...zendaMap};
+  for (const [k, entry] of Object.entries(merged)) {
+    const rawUrl = String(entry?.url || '').toLowerCase();
+    if (STALE_URL_HOSTS.some(bad => rawUrl.includes(bad))) {
+      const alt =
+        punisherMap[k] ||
+        Object.entries(punisherMap).find(
+          ([pk]) => pk.toLowerCase() === k.toLowerCase(),
+        )?.[1];
+      if (alt?.url) {
+        merged[k] = alt;
+      }
     }
-  } catch {
-    // Ignore error and return cached or empty map
+  }
+
+  if (Object.keys(merged).length > 0) {
+    cachedModflixMap = merged;
+    cachedModflixAt = now;
+    return merged;
   }
   return cachedModflixMap || {};
 }

@@ -51,7 +51,7 @@ export class ProviderManager {
     providerValue: string;
     sourceAuthor?: string;
   }): Catalog[] {
-    const {author, module: catalogModule} = this.getProviderModule(
+    const {module: catalogModule} = this.getProviderModule(
       providerValue,
       sourceAuthor,
     );
@@ -67,12 +67,39 @@ export class ProviderManager {
         return mod.exports.catalog;
       }
     } catch {
-      // Fallback handled by async or empty
+      // Async or sandbox-dependent catalog handled by getCatalogAsync
     }
-    runProviderCatalog(catalogModule.modules.catalog, providerValue, author).catch(
-      () => {},
-    );
     return [];
+  }
+
+  async getCatalogAsync({
+    providerValue,
+    sourceAuthor,
+  }: {
+    providerValue: string;
+    sourceAuthor?: string;
+  }): Promise<Catalog[]> {
+    const syncCatalog = this.getCatalog({providerValue, sourceAuthor});
+    if (syncCatalog.length > 0) {
+      return syncCatalog;
+    }
+    const {author, module: catalogModule} = this.getProviderModule(
+      providerValue,
+      sourceAuthor,
+    );
+    if (!catalogModule?.modules.catalog) {
+      return [];
+    }
+    try {
+      const res = await runProviderCatalog(
+        catalogModule.modules.catalog,
+        providerValue,
+        author,
+      );
+      return Array.isArray(res.catalog) ? res.catalog : [];
+    } catch {
+      return [];
+    }
   }
 
   getGenres({

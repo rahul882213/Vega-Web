@@ -429,9 +429,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             remoteProbeEndpointUnsupported = true;
           }
         } catch {
-          if (base === remoteBackendBase) {
-            remoteProbeEndpointUnsupported = true;
-          }
+          // Transient error — do not permanently disable probing for session
         }
       }
       throw new Error('Probe endpoint unavailable');
@@ -1482,7 +1480,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                         return prev;
                       }
                       if (res.status === 426) {
-                        return `Proxy returned HTTP 426 (HTTP/2 required at ${streamProxyBase || 'backend'}). Redeploy your remote backend or update the Remote Backend URL in Settings.`;
+                        return `Upstream CDN returned HTTP 426${detail ? ` (${detail})` : ''} via ${streamProxyBase || 'backend'}. Try switching server or retry in a moment.`;
                       }
                       if (res.status === 415) {
                         return 'Upstream returned an HTML webpage instead of a playable video stream. Try another server.';

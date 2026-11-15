@@ -469,7 +469,7 @@ export class SettingsStorage {
     if (custom && custom.trim()) {
       return custom.trim().replace(/\/+$/, '');
     }
-    return 'https://vegawebs.netlify.app';
+    return getDefaultRemoteBackendUrl();
   }
 
   setRemoteBackendUrl(url: string): void {
@@ -484,6 +484,15 @@ export class SettingsStorage {
 
 export const settingsStorage = new SettingsStorage();
 
+export function getDefaultRemoteBackendUrl(): string {
+  const envUrl =
+    typeof import.meta !== 'undefined' &&
+    (import.meta as any).env?.VITE_REMOTE_BACKEND_URL
+      ? String((import.meta as any).env.VITE_REMOTE_BACKEND_URL).trim()
+      : '';
+  return envUrl.replace(/\/+$/, '');
+}
+
 export function isStaticOrGitHubPagesHost(): boolean {
   if (typeof window === 'undefined') return false;
   const host = window.location.hostname.toLowerCase();
@@ -491,7 +500,6 @@ export function isStaticOrGitHubPagesHost(): boolean {
     host.endsWith('github.io') ||
     (!host.includes('localhost') &&
       !host.includes('127.0.0.1') &&
-      !host.includes('netlify.app') &&
       !host.endsWith('.run.app'))
   );
 }

@@ -207,7 +207,6 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     (window.location.hostname.endsWith('github.io') ||
       (!window.location.hostname.includes('localhost') &&
         !window.location.hostname.includes('127.0.0.1') &&
-        !window.location.hostname.includes('netlify.app') &&
         !window.location.hostname.endsWith('.run.app')));
   const [decoderMode, setDecoderMode] = useState<DecoderMode>('direct');
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
@@ -411,10 +410,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
 
     const probeStreamWithFallback = async () => {
       const candidates = isRemoteTranscodeHost
-        ? remoteProbeEndpointUnsupported
+        ? remoteProbeEndpointUnsupported || !remoteBackendBase
           ? []
           : [remoteBackendBase]
-        : remoteProbeEndpointUnsupported
+        : remoteProbeEndpointUnsupported || !remoteBackendBase
           ? ['']
           : ['', remoteBackendBase];
       for (const base of candidates) {
@@ -890,8 +889,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             subParams.set('headers', encodedStreamHeaders);
           }
           const bases = isRemoteTranscodeHost
-            ? [remoteBackendBase, '']
-            : ['', remoteBackendBase];
+            ? remoteBackendBase
+              ? [remoteBackendBase, '']
+              : ['']
+            : remoteBackendBase
+              ? ['', remoteBackendBase]
+              : [''];
           for (const base of bases) {
             try {
               const res = await fetch(
@@ -1282,7 +1285,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const absoluteDirectStreamUrl = useMemo(() => {
     if (!selectedStream?.link) return '';
     const originBase = isRemoteTranscodeHost
-      ? remoteBackendBase
+      ? remoteBackendBase || window.location.origin
       : window.location.origin;
     if (selectedStream.link.startsWith('http')) {
       const hasCustomHeaders = Boolean(encodedStreamHeaders);
@@ -1403,6 +1406,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             if (
               decoderMode === 'direct' &&
               !useRemoteProxyFallback &&
+              Boolean(remoteBackendBase) &&
               !isLocalBlob &&
               !tried.has('remote')
             ) {

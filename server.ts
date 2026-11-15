@@ -349,12 +349,32 @@ async function probeRemoteStream(
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
+  const rawAllowedOrigins = String(process.env.ALLOWED_ORIGINS || '*').trim();
+  const allowedOriginList =
+    rawAllowedOrigins === '*'
+      ? ['*']
+      : rawAllowedOrigins
+          .split(',')
+          .map(o => o.trim().replace(/\/+$/, ''))
+          .filter(Boolean);
 
+  app.set('trust proxy', 1);
   app.use(express.json({limit: '25mb'}));
 
   app.use('/api', (req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const reqOrigin = String(req.headers.origin || '').trim().replace(/\/+$/, '');
+    if (allowedOriginList.includes('*')) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else if (reqOrigin) {
+      const matched = allowedOriginList.find(
+        o => o.toLowerCase() === reqOrigin.toLowerCase(),
+      );
+      if (matched) {
+        res.setHeader('Access-Control-Allow-Origin', matched);
+        res.setHeader('Vary', 'Origin');
+      }
+    }
     res.setHeader(
       'Access-Control-Allow-Methods',
       'GET, POST, PUT, DELETE, HEAD, OPTIONS',
@@ -364,6 +384,7 @@ async function startServer() {
       'Access-Control-Expose-Headers',
       'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Video-Duration, X-Video-Codec',
     );
+    res.setHeader('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -371,7 +392,17 @@ async function startServer() {
     next();
   });
 
-  app.post('/api/proxy', async (req, res) => {
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      status: 'healthy',
+      service: 'vega-web-server',
+      uptime: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  const handleApiProxy = async (req: express.Request, res: express.Response) => {
     try {
       const {
         url,
@@ -729,7 +760,10 @@ async function startServer() {
         error: error?.message || 'Proxy request failed',
       });
     }
-  });
+  };
+
+  app.post('/api/proxy', handleApiProxy);
+  app.post('/api/edge-proxy', handleApiProxy);
 
   app.get('/api/base-url', async (req, res) => {
     try {

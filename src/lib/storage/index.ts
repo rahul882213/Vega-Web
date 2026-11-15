@@ -22,6 +22,7 @@ export {
   PLAYER_RESIZE_MODES,
   isStaticOrGitHubPagesHost,
   getEffectiveApiBaseUrl,
+  getDefaultRemoteBackendUrl,
 } from './SettingsStorage';
 export type {
   SettingsKeys,

@@ -379,21 +379,19 @@ export async function proxyFetch(
     redirect: init?.redirect || 'follow',
   });
 
-  // 2. Try backend proxy (/api/proxy and remote Netlify backend)
+  // 2. Try backend proxy (/api/proxy and optional remote Node.js Express backend)
   const isStaticHost = isStaticOrGitHubPagesHost();
   const remoteBackend = settingsStorage.getRemoteBackendUrl();
 
   const proxyEndpoints = isStaticHost
-    ? [`${remoteBackend}/api/proxy`]
-    : [
-        '/api/proxy',
-        '/.netlify/functions/proxy',
-        `${remoteBackend}/api/proxy`,
-      ];
+    ? remoteBackend
+      ? [`${remoteBackend}/api/proxy`]
+      : []
+    : remoteBackend
+      ? ['/api/proxy', `${remoteBackend}/api/proxy`]
+      : ['/api/proxy'];
 
-  const edgeEndpoint = isStaticHost
-    ? `${remoteBackend}/api/edge-proxy`
-    : '/api/edge-proxy';
+  const edgeEndpoint = remoteBackend ? `${remoteBackend}/api/edge-proxy` : '';
 
   let blockedResult: {
     status: number;
@@ -473,8 +471,8 @@ export async function proxyFetch(
     }
   }
 
-  // Fallback to Edge Proxy PoP ONLY if primary proxy failed or hit Cloudflare WAF
-  if (!edgeProxyUnsupported) {
+  // Fallback to secondary /api/edge-proxy endpoint on remote backend if configured
+  if (!edgeProxyUnsupported && edgeEndpoint) {
     try {
       const edgeOutcome = await tryProxyEndpoint(edgeEndpoint);
       if (!edgeOutcome.skip) {

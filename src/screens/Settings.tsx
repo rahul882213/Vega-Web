@@ -30,6 +30,7 @@ import {
   extensionStorage,
   settingsStorage,
   getEffectiveApiBaseUrl,
+  getDefaultRemoteBackendUrl,
   isStaticOrGitHubPagesHost,
 } from '../lib/storage';
 import {showAppDialog} from '../lib/zustand/appDialogStore';
@@ -461,7 +462,7 @@ export const Settings: React.FC = () => {
                 type="text"
                 value={remoteBackendUrl}
                 onChange={e => setRemoteBackendUrlState(e.target.value)}
-                placeholder="https://vegawebs.netlify.app"
+                placeholder="https://your-vega-backend.onrender.com"
                 className="flex-1 h-9 px-3 rounded-xl border text-xs outline-none"
                 style={{
                   backgroundColor: colors.surfaceContainerHigh,
@@ -473,14 +474,15 @@ export const Settings: React.FC = () => {
                 <button
                   onClick={() => {
                     const trimmed =
-                      remoteBackendUrl.trim() || 'https://vegawebs.netlify.app';
+                      remoteBackendUrl.trim() || getDefaultRemoteBackendUrl();
                     settingsStorage.setRemoteBackendUrl(trimmed);
-                    setRemoteBackendUrlState(
-                      settingsStorage.getRemoteBackendUrl(),
-                    );
+                    const updated = settingsStorage.getRemoteBackendUrl();
+                    setRemoteBackendUrlState(updated);
                     showAppDialog({
-                      title: 'Backend Saved',
-                      message: `Remote backend set to: ${settingsStorage.getRemoteBackendUrl()}`,
+                      title: updated ? 'Backend Saved' : 'Backend Cleared',
+                      message: updated
+                        ? `Remote backend set to: ${updated}`
+                        : 'Remote backend URL cleared. Using same-origin /api endpoints.',
                       variant: 'success',
                     });
                   }}
@@ -493,14 +495,14 @@ export const Settings: React.FC = () => {
                 </button>
                 <button
                   onClick={() => {
-                    settingsStorage.setRemoteBackendUrl(
-                      'https://vegawebs.netlify.app',
-                    );
-                    setRemoteBackendUrlState('https://vegawebs.netlify.app');
+                    const defaultUrl = getDefaultRemoteBackendUrl();
+                    settingsStorage.setRemoteBackendUrl(defaultUrl);
+                    setRemoteBackendUrlState(defaultUrl);
                     showAppDialog({
                       title: 'Reset to Default',
-                      message:
-                        'Reset remote backend to default: https://vegawebs.netlify.app',
+                      message: defaultUrl
+                        ? `Reset remote backend to default: ${defaultUrl}`
+                        : 'Cleared custom remote backend URL.',
                       variant: 'default',
                     });
                   }}

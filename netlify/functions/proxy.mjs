@@ -1,3 +1,4 @@
+import http2 from 'http2';
 import axios from 'axios';
 import https from 'https';
 
@@ -16,6 +17,153 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': '*',
   'Content-Type': 'application/json',
 };
+
+function fetchViaHttp2({
+  url,
+  method = 'GET',
+  headers = {},
+  bodyBuffer,
+  redirect = 'follow',
+  timeoutMs = 22000,
+  redirectsLeft = 8,
+}) {
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    let client;
+    let req;
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        if (req && typeof req.destroy === 'function') req.destroy();
+        if (client && typeof client.close === 'function') client.close();
+        reject(new Error('HTTP/2 proxy timeout'));
+      }
+    }, timeoutMs);
+
+    try {
+      const parsed = new URL(url);
+      client = http2.connect(parsed.origin);
+
+      client.on('error', err => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+
+      const upperMethod = String(method).toUpperCase();
+      const h2Headers = {
+        ':method': upperMethod,
+        ':path': parsed.pathname + parsed.search,
+      };
+
+      for (const [k, v] of Object.entries(headers)) {
+        const lower = k.toLowerCase();
+        if (
+          lower === 'host' ||
+          lower === 'connection' ||
+          lower === 'keep-alive' ||
+          lower === 'transfer-encoding' ||
+          lower === 'upgrade' ||
+          lower === 'http2-settings' ||
+          lower === 'accept-encoding'
+        ) {
+          continue;
+        }
+        h2Headers[lower] = String(v);
+      }
+
+      if (bodyBuffer && bodyBuffer.length > 0 && upperMethod !== 'GET' && upperMethod !== 'HEAD') {
+        h2Headers['content-length'] = String(bodyBuffer.length);
+      }
+
+      req = client.request(h2Headers);
+      let respHeaders = {};
+      const chunks = [];
+
+      req.on('response', h => {
+        respHeaders = h;
+      });
+
+      req.on('data', chunk => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+
+      req.on('end', () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          if (client && typeof client.close === 'function') client.close();
+          const statusCode = Number(respHeaders[':status'] || 200);
+
+          if (
+            redirect !== 'manual' &&
+            statusCode >= 300 &&
+            statusCode < 400 &&
+            respHeaders['location'] &&
+            redirectsLeft > 0
+          ) {
+            const nextUrl = new URL(
+              String(respHeaders['location']),
+              url,
+            ).toString();
+            const nextMethod =
+              statusCode === 307 || statusCode === 308 ? upperMethod : 'GET';
+            const nextBody =
+              statusCode === 307 || statusCode === 308 ? bodyBuffer : undefined;
+            return resolve(
+              fetchViaHttp2({
+                url: nextUrl,
+                method: nextMethod,
+                headers,
+                bodyBuffer: nextBody,
+                redirect,
+                timeoutMs,
+                redirectsLeft: redirectsLeft - 1,
+              }),
+            );
+          }
+
+          const cleanHeaders = {};
+          for (const [hk, hv] of Object.entries(respHeaders)) {
+            if (hk.startsWith(':') || hv === undefined) continue;
+            cleanHeaders[hk.toLowerCase()] = hv;
+          }
+
+          resolve({
+            status: statusCode,
+            statusText: '',
+            headers: cleanHeaders,
+            data: Buffer.concat(chunks),
+            finalUrl: url,
+          });
+        }
+      });
+
+      req.on('error', err => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          if (client && typeof client.close === 'function') client.close();
+          reject(err);
+        }
+      });
+
+      if (bodyBuffer && bodyBuffer.length > 0 && upperMethod !== 'GET' && upperMethod !== 'HEAD') {
+        req.write(bodyBuffer);
+      }
+      req.end();
+    } catch (err) {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        if (client && typeof client.close === 'function') client.close();
+        reject(err);
+      }
+    }
+  });
+}
 
 export async function handler(event) {
   if (event.httpMethod === 'OPTIONS') {
@@ -78,17 +226,58 @@ export async function handler(event) {
         ? Buffer.from(bodyBase64, 'base64')
         : undefined;
 
-    const response = await axios.request({
-      url,
-      method: String(method).toUpperCase(),
-      headers: outgoingHeaders,
-      data: bodyBuffer,
-      responseType: 'arraybuffer',
-      maxRedirects: redirect === 'manual' ? 0 : 8,
-      validateStatus: () => true,
-      timeout: 22000,
-      httpsAgent,
-    });
+    const isKnownH2Host =
+      url.includes('hakunaymatata.com') ||
+      url.includes('aoneroom.com') ||
+      url.includes('bcdnxw') ||
+      url.includes('moviebox');
+
+    let response;
+    if (isKnownH2Host) {
+      try {
+        response = await fetchViaHttp2({
+          url,
+          method,
+          headers: outgoingHeaders,
+          bodyBuffer,
+          redirect,
+          timeoutMs: 22000,
+        });
+      } catch {
+        response = undefined;
+      }
+    }
+
+    if (!response || response.status === 426 || response.status === 428) {
+      const axiosRes = await axios.request({
+        url,
+        method: String(method).toUpperCase(),
+        headers: outgoingHeaders,
+        data: bodyBuffer,
+        responseType: 'arraybuffer',
+        maxRedirects: redirect === 'manual' ? 0 : 8,
+        validateStatus: () => true,
+        timeout: 22000,
+        httpsAgent,
+      });
+
+      if ((axiosRes.status === 426 || axiosRes.status === 428) && !isKnownH2Host) {
+        try {
+          response = await fetchViaHttp2({
+            url,
+            method,
+            headers: outgoingHeaders,
+            bodyBuffer,
+            redirect,
+            timeoutMs: 22000,
+          });
+        } catch {
+          response = axiosRes;
+        }
+      } else {
+        response = axiosRes;
+      }
+    }
 
     // If Cloudflare/WAF blocks AWS Lambda IP (403 / 429 / 503 or CF challenge HTML) on GET, relay via public fetch proxies
     const upperMethod = String(method).toUpperCase();
@@ -195,7 +384,10 @@ export async function handler(event) {
     }
 
     const finalUrl =
-      response.request?.res?.responseUrl || response.config?.url || url;
+      response.finalUrl ||
+      response.request?.res?.responseUrl ||
+      response.config?.url ||
+      url;
     const rawBuffer = Buffer.isBuffer(response.data)
       ? response.data
       : Buffer.from(response.data || []);

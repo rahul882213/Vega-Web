@@ -201,6 +201,7 @@ function rewriteM3u8Playlist(
   playlistText: string,
   baseUrl: string,
   encodedHeaders: string,
+  proxyOrigin = '',
 ): string {
   const buildProxyUrl = (rawTarget: string) => {
     try {
@@ -210,7 +211,7 @@ function rewriteM3u8Playlist(
       if (encodedHeaders) {
         params.set('headers', encodedHeaders);
       }
-      return `/api/stream-proxy?${params.toString()}`;
+      return `${proxyOrigin}/api/stream-proxy?${params.toString()}`;
     } catch {
       return rawTarget;
     }
@@ -413,17 +414,201 @@ async function startServer() {
           ? Buffer.from(bodyBase64, 'base64')
           : undefined;
 
-      const response = await axios.request({
-        url,
-        method: String(method).toUpperCase(),
-        headers: outgoingHeaders,
-        data: bodyBuffer,
-        responseType: 'arraybuffer',
-        maxRedirects: redirect === 'manual' ? 0 : 8,
-        validateStatus: () => true,
-        timeout: 30000,
-        httpsAgent,
-      });
+      const fetchProxyViaHttp2 = (
+        targetUrl: string,
+        reqMethod: string,
+        reqHeaders: Record<string, string>,
+        bodyBuf?: Buffer,
+        redirectMode = 'follow',
+        redirectsLeft = 8,
+      ): Promise<{
+        status: number;
+        statusText: string;
+        headers: Record<string, string | string[]>;
+        data: Buffer;
+        finalUrl: string;
+      }> =>
+        new Promise((resolve, reject) => {
+          let resolved = false;
+          let client: http2.ClientHttp2Session | undefined;
+          let h2Req: http2.ClientHttp2Stream | undefined;
+          const timer = setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              h2Req?.destroy();
+              client?.close();
+              reject(new Error('HTTP/2 proxy timeout'));
+            }
+          }, 25000);
+
+          try {
+            const parsed = new URL(targetUrl);
+            client = http2.connect(parsed.origin);
+            client.on('error', err => {
+              if (!resolved) {
+                resolved = true;
+                clearTimeout(timer);
+                reject(err);
+              }
+            });
+
+            const upperM = String(reqMethod).toUpperCase();
+            const h2Headers: Record<string, string> = {
+              ':method': upperM,
+              ':path': parsed.pathname + parsed.search,
+            };
+
+            for (const [k, v] of Object.entries(reqHeaders)) {
+              const lower = k.toLowerCase();
+              if (
+                lower === 'host' ||
+                lower === 'connection' ||
+                lower === 'keep-alive' ||
+                lower === 'transfer-encoding' ||
+                lower === 'upgrade' ||
+                lower === 'http2-settings' ||
+                lower === 'accept-encoding'
+              ) {
+                continue;
+              }
+              h2Headers[lower] = String(v);
+            }
+
+            if (bodyBuf && bodyBuf.length > 0 && upperM !== 'GET' && upperM !== 'HEAD') {
+              h2Headers['content-length'] = String(bodyBuf.length);
+            }
+
+            h2Req = client.request(h2Headers);
+            let respHeaders: Record<string, any> = {};
+            const chunks: Buffer[] = [];
+
+            h2Req.on('response', h => {
+              respHeaders = h;
+            });
+            h2Req.on('data', chunk => {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            });
+            h2Req.on('end', () => {
+              if (!resolved) {
+                resolved = true;
+                clearTimeout(timer);
+                client?.close();
+                const statusCode = Number(respHeaders[':status'] || 200);
+                if (
+                  redirectMode !== 'manual' &&
+                  statusCode >= 300 &&
+                  statusCode < 400 &&
+                  respHeaders['location'] &&
+                  redirectsLeft > 0
+                ) {
+                  const nextUrl = new URL(
+                    String(respHeaders['location']),
+                    targetUrl,
+                  ).toString();
+                  const nextMethod =
+                    statusCode === 307 || statusCode === 308 ? upperM : 'GET';
+                  const nextBody =
+                    statusCode === 307 || statusCode === 308 ? bodyBuf : undefined;
+                  return resolve(
+                    fetchProxyViaHttp2(
+                      nextUrl,
+                      nextMethod,
+                      reqHeaders,
+                      nextBody,
+                      redirectMode,
+                      redirectsLeft - 1,
+                    ),
+                  );
+                }
+
+                const cleanHeaders: Record<string, string | string[]> = {};
+                for (const [hk, hv] of Object.entries(respHeaders)) {
+                  if (hk.startsWith(':') || hv === undefined) continue;
+                  cleanHeaders[hk.toLowerCase()] = hv as string | string[];
+                }
+
+                resolve({
+                  status: statusCode,
+                  statusText: '',
+                  headers: cleanHeaders,
+                  data: Buffer.concat(chunks),
+                  finalUrl: targetUrl,
+                });
+              }
+            });
+            h2Req.on('error', err => {
+              if (!resolved) {
+                resolved = true;
+                clearTimeout(timer);
+                client?.close();
+                reject(err);
+              }
+            });
+
+            if (bodyBuf && bodyBuf.length > 0 && upperM !== 'GET' && upperM !== 'HEAD') {
+              h2Req.write(bodyBuf);
+            }
+            h2Req.end();
+          } catch (err) {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timer);
+              client?.close();
+              reject(err);
+            }
+          }
+        });
+
+      const isKnownH2Host =
+        url.includes('hakunaymatata.com') ||
+        url.includes('aoneroom.com') ||
+        url.includes('bcdnxw') ||
+        url.includes('moviebox');
+
+      let response: any;
+      if (isKnownH2Host) {
+        try {
+          response = await fetchProxyViaHttp2(
+            url,
+            method,
+            outgoingHeaders,
+            bodyBuffer,
+            redirect,
+          );
+        } catch {
+          response = undefined;
+        }
+      }
+
+      if (!response || response.status === 426 || response.status === 428) {
+        const axiosRes = await axios.request({
+          url,
+          method: String(method).toUpperCase(),
+          headers: outgoingHeaders,
+          data: bodyBuffer,
+          responseType: 'arraybuffer',
+          maxRedirects: redirect === 'manual' ? 0 : 8,
+          validateStatus: () => true,
+          timeout: 30000,
+          httpsAgent,
+        });
+
+        if ((axiosRes.status === 426 || axiosRes.status === 428) && !isKnownH2Host) {
+          try {
+            response = await fetchProxyViaHttp2(
+              url,
+              method,
+              outgoingHeaders,
+              bodyBuffer,
+              redirect,
+            );
+          } catch {
+            response = axiosRes;
+          }
+        } else {
+          response = axiosRes;
+        }
+      }
 
       const upperMethod = String(method).toUpperCase();
       const rawBuf = Buffer.isBuffer(response.data)
@@ -524,7 +709,10 @@ async function startServer() {
       }
 
       const finalUrl =
-        response.request?.res?.responseUrl || response.config?.url || url;
+        response.finalUrl ||
+        response.request?.res?.responseUrl ||
+        response.config?.url ||
+        url;
       const rawBuffer = Buffer.isBuffer(response.data)
         ? response.data
         : Buffer.from(response.data || []);
@@ -777,12 +965,25 @@ async function startServer() {
     });
   });
 
+  function getProxyOrigin(req: express.Request): string {
+    const proto = String(
+      req.headers['x-forwarded-proto'] || req.protocol || 'http',
+    )
+      .split(',')[0]
+      .trim();
+    const host = String(
+      req.headers['x-forwarded-host'] || req.get('host') || '',
+    ).trim();
+    return host ? `${proto}://${host}` : '';
+  }
+
   function streamViaHttp2(
     targetUrl: string,
     outgoingHeaders: Record<string, string>,
     res: express.Response,
     req: express.Request,
     isDownload: boolean,
+    encodedHeaders: string,
     redirectsLeft = 5,
   ) {
     try {
@@ -796,7 +997,7 @@ async function startServer() {
       });
 
       const h2Headers: Record<string, string> = {
-        ':method': 'GET',
+        ':method': req.method === 'HEAD' ? 'HEAD' : 'GET',
         ':path': parsed.pathname + parsed.search,
       };
 
@@ -838,6 +1039,7 @@ async function startServer() {
             res,
             req,
             isDownload,
+            encodedHeaders,
             redirectsLeft - 1,
           );
         }
@@ -845,12 +1047,19 @@ async function startServer() {
         const contentType = String(respHeaders['content-type'] || '').toLowerCase();
         const lowerTarget = targetUrl.split('?')[0].toLowerCase();
         const isTextSub =
-          lowerTarget.endsWith('.vtt') || lowerTarget.endsWith('.srt');
+          lowerTarget.endsWith('.vtt') ||
+          lowerTarget.endsWith('.srt') ||
+          contentType.includes('subrip') ||
+          contentType.includes('text/vtt');
         const isManifest =
           lowerTarget.endsWith('.m3u8') ||
           lowerTarget.endsWith('.mpd') ||
           contentType.includes('mpegurl') ||
           contentType.includes('dash+xml');
+        const isM3u8 =
+          lowerTarget.endsWith('.m3u8') ||
+          contentType.includes('mpegurl') ||
+          contentType.includes('x-mpegurl');
 
         if (
           statusCode >= 200 &&
@@ -865,6 +1074,43 @@ async function startServer() {
           res
             .status(415)
             .send('Upstream returned an HTML webpage instead of a media stream');
+          return;
+        }
+
+        if (
+          isM3u8 &&
+          statusCode >= 200 &&
+          statusCode < 300 &&
+          req.method !== 'HEAD'
+        ) {
+          const chunks: Buffer[] = [];
+          h2Req.on('data', chunk => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          h2Req.on('end', () => {
+            client.close();
+            if (res.headersSent) return;
+            const rawBuffer = Buffer.concat(chunks);
+            const rawText = rawBuffer.toString('utf8');
+            if (rawText.trimStart().startsWith('#EXTM3U')) {
+              const rewritten = rewriteM3u8Playlist(
+                rawText,
+                targetUrl,
+                encodedHeaders,
+                getProxyOrigin(req),
+              );
+              res.status(statusCode);
+              res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+              res.setHeader('Cache-Control', 'no-cache');
+              res.send(rewritten);
+              return;
+            }
+            res.status(statusCode);
+            if (respHeaders['content-type']) {
+              res.setHeader('Content-Type', String(respHeaders['content-type']));
+            }
+            res.send(rawBuffer);
+          });
           return;
         }
 
@@ -890,6 +1136,10 @@ async function startServer() {
             'Content-Type',
             String(respHeaders['content-type'] || 'application/octet-stream'),
           );
+        } else if (lowerTarget.endsWith('.vtt') || contentType.includes('vtt')) {
+          res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+        } else if (lowerTarget.endsWith('.srt') || contentType.includes('subrip')) {
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         } else if (lowerTarget.endsWith('.mpd') || contentType.includes('dash+xml')) {
           res.setHeader('Content-Type', 'application/dash+xml');
         } else if (
@@ -907,10 +1157,22 @@ async function startServer() {
           res.setHeader('Accept-Ranges', 'bytes');
         }
 
+        if (req.method === 'HEAD') {
+          h2Req.destroy();
+          client.close();
+          res.end();
+          return;
+        }
+
+        h2Req.on('end', () => {
+          client.close();
+        });
+
         h2Req.pipe(res);
       });
 
       h2Req.on('error', err => {
+        client.close();
         if (!res.headersSent) {
           res.status(502).send(err?.message || 'HTTP/2 stream error');
         } else {
@@ -965,10 +1227,19 @@ async function startServer() {
         targetUrl.includes('moviebox');
 
       if (isKnownH2Host) {
-        return streamViaHttp2(targetUrl, outgoingHeaders, res, req, isDownload);
+        return streamViaHttp2(
+          targetUrl,
+          outgoingHeaders,
+          res,
+          req,
+          isDownload,
+          encodedHeaders,
+        );
       }
 
-      const upstream = await axios.get(targetUrl, {
+      const upstream = await axios.request({
+        url: targetUrl,
+        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
         headers: outgoingHeaders,
         responseType: 'stream',
         maxRedirects: 8,
@@ -978,7 +1249,14 @@ async function startServer() {
       });
 
       if (upstream.status === 426 || upstream.status === 428) {
-        return streamViaHttp2(targetUrl, outgoingHeaders, res, req, isDownload);
+        return streamViaHttp2(
+          targetUrl,
+          outgoingHeaders,
+          res,
+          req,
+          isDownload,
+          encodedHeaders,
+        );
       }
 
       const finalUrl =
@@ -1005,7 +1283,9 @@ async function startServer() {
         lowerFinalPath.endsWith('.vtt') ||
         lowerFinalPath.endsWith('.srt') ||
         lowerTargetPath.endsWith('.vtt') ||
-        lowerTargetPath.endsWith('.srt');
+        lowerTargetPath.endsWith('.srt') ||
+        contentType.includes('subrip') ||
+        contentType.includes('text/vtt');
 
       if (
         upstream.status >= 200 &&
@@ -1025,7 +1305,12 @@ async function startServer() {
         return;
       }
 
-      if (isM3u8 && upstream.status >= 200 && upstream.status < 300) {
+      if (
+        isM3u8 &&
+        upstream.status >= 200 &&
+        upstream.status < 300 &&
+        req.method !== 'HEAD'
+      ) {
         const chunks: Buffer[] = [];
         for await (const chunk of upstream.data) {
           chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -1036,6 +1321,7 @@ async function startServer() {
             rawText,
             finalUrl,
             encodedHeaders,
+            getProxyOrigin(req),
           );
           res.status(upstream.status);
           res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');

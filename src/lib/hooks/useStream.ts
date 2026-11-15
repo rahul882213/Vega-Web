@@ -183,8 +183,23 @@ export const useStream = ({
 
       const finalPool = validPool.length > 0 ? validPool : normalizedData;
 
-      // Prioritize direct playable media streams over webpage / download-only candidates
-      finalPool.sort((a, b) => scoreStreamCandidate(a) - scoreStreamCandidate(b));
+      // Prioritize direct playable media streams over webpage / download-only candidates;
+      // within identical candidate score tiers (e.g. MovieBox 360/480/720/1080), prefer 720p -> 1080p -> 480p -> 360p
+      const qualityRank = (q?: string): number => {
+        const n = Number(String(q || '').replace(/p$/i, ''));
+        if (!Number.isFinite(n) || n <= 0) return 0;
+        if (n === 720) return 4;
+        if (n === 1080) return 3;
+        if (n === 480) return 2;
+        if (n === 2160) return 2;
+        if (n === 360) return 1;
+        return 1;
+      };
+      finalPool.sort((a, b) => {
+        const scoreDiff = scoreStreamCandidate(a) - scoreStreamCandidate(b);
+        if (scoreDiff !== 0) return scoreDiff;
+        return qualityRank(b.quality) - qualityRank(a.quality);
+      });
 
       const excludedQualities = settingsStorage.getExcludedQualities() || [];
       const filteredQualities = finalPool.filter(

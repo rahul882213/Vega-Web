@@ -78,7 +78,13 @@ function rewriteM3u8Playlist(playlistText, baseUrl, encodedHeaders, hostPrefix =
     .join('\n');
 }
 
-function fetchViaHttp2(targetUrl, outgoingHeaders, timeoutMs = 25000, redirectsLeft = 5) {
+function fetchViaHttp2(
+  targetUrl,
+  outgoingHeaders,
+  timeoutMs = 25000,
+  redirectsLeft = 5,
+  method = 'GET',
+) {
   return new Promise((resolve, reject) => {
     let resolved = false;
     let client;
@@ -105,7 +111,7 @@ function fetchViaHttp2(targetUrl, outgoingHeaders, timeoutMs = 25000, redirectsL
       });
 
       const h2Headers = {
-        ':method': 'GET',
+        ':method': method === 'HEAD' ? 'HEAD' : 'GET',
         ':path': parsed.pathname + parsed.search,
       };
 
@@ -154,7 +160,13 @@ function fetchViaHttp2(targetUrl, outgoingHeaders, timeoutMs = 25000, redirectsL
               targetUrl,
             ).toString();
             return resolve(
-              fetchViaHttp2(nextUrl, outgoingHeaders, timeoutMs, redirectsLeft - 1),
+              fetchViaHttp2(
+                nextUrl,
+                outgoingHeaders,
+                timeoutMs,
+                redirectsLeft - 1,
+                method,
+              ),
             );
           }
 
@@ -246,9 +258,15 @@ export async function handler(event) {
     const incomingRange =
       event.headers?.range || event.headers?.Range || undefined;
 
+    const isHeadRequest = String(event.httpMethod || 'GET').toUpperCase() === 'HEAD';
+
     // For direct MP4/MKV streams (such as MovieBox Web), clamp each HTTP Range request to 2.5 MB
     // so Netlify Functions never exceed serverless payload limits while preserving custom Referer/Origin headers
-    if (!isLikelyM3u8 && !isLikelyMpd && !isTextSubtitle && !isHlsSegment) {
+    if (isHeadRequest) {
+      if (incomingRange) {
+        outgoingHeaders['Range'] = incomingRange;
+      }
+    } else if (!isLikelyM3u8 && !isLikelyMpd && !isTextSubtitle && !isHlsSegment) {
       outgoingHeaders['Range'] = clampRangeHeader(incomingRange);
     } else if (incomingRange) {
       outgoingHeaders['Range'] = incomingRange;
@@ -260,17 +278,26 @@ export async function handler(event) {
       targetUrl.includes('bcdnxw') ||
       targetUrl.includes('moviebox');
 
+    const upstreamMethod = isHeadRequest ? 'HEAD' : 'GET';
     let upstream;
     if (isKnownH2Host) {
       try {
-        upstream = await fetchViaHttp2(targetUrl, outgoingHeaders, 25000);
+        upstream = await fetchViaHttp2(
+          targetUrl,
+          outgoingHeaders,
+          25000,
+          5,
+          upstreamMethod,
+        );
       } catch (h2Err) {
         console.warn('Direct HTTP/2 failed, falling back to axios:', h2Err?.message);
       }
     }
 
     if (!upstream || upstream.status === 426 || upstream.status === 428) {
-      const axiosRes = await axios.get(targetUrl, {
+      const axiosRes = await axios.request({
+        url: targetUrl,
+        method: upstreamMethod,
         headers: outgoingHeaders,
         responseType: 'arraybuffer',
         maxRedirects: 8,
@@ -284,7 +311,13 @@ export async function handler(event) {
         !isKnownH2Host
       ) {
         try {
-          upstream = await fetchViaHttp2(targetUrl, outgoingHeaders, 25000);
+          upstream = await fetchViaHttp2(
+            targetUrl,
+            outgoingHeaders,
+            25000,
+            5,
+            upstreamMethod,
+          );
         } catch {
           upstream = {
             status: axiosRes.status,
@@ -325,6 +358,13 @@ export async function handler(event) {
       finalUrl.split('?')[0].toLowerCase().endsWith('.mpd') ||
       isLikelyMpd;
 
+    const isResolvedSubtitle =
+      isTextSubtitle ||
+      finalUrl.split('?')[0].toLowerCase().endsWith('.vtt') ||
+      finalUrl.split('?')[0].toLowerCase().endsWith('.srt') ||
+      contentType.includes('subrip') ||
+      contentType.includes('vtt');
+
     const rawBuffer = Buffer.isBuffer(upstream.data)
       ? upstream.data
       : Buffer.from(upstream.data || []);
@@ -335,7 +375,7 @@ export async function handler(event) {
       contentType.includes('text/html') &&
       !isM3u8 &&
       !isMpd &&
-      !isTextSubtitle
+      !isResolvedSubtitle
     ) {
       return {
         statusCode: 415,
@@ -344,7 +384,12 @@ export async function handler(event) {
       };
     }
 
-    if (isM3u8 && upstream.status >= 200 && upstream.status < 300) {
+    if (
+      isM3u8 &&
+      upstream.status >= 200 &&
+      upstream.status < 300 &&
+      !isHeadRequest
+    ) {
       const rawText = rawBuffer.toString('utf8');
       if (rawText.trimStart().startsWith('#EXTM3U')) {
         const requestHost =
@@ -375,7 +420,9 @@ export async function handler(event) {
       'Access-Control-Expose-Headers':
         'Content-Length, Content-Range, Accept-Ranges, Content-Type',
       'Accept-Ranges': 'bytes',
-      'Content-Length': String(rawBuffer.length),
+      'Content-Length': isHeadRequest
+        ? String(upstream.headers['content-length'] || rawBuffer.length || 0)
+        : String(rawBuffer.length),
     };
 
     if (upstream.headers['content-range']) {
@@ -392,8 +439,22 @@ export async function handler(event) {
       );
     }
 
-    if (isMpd) {
+    if (
+      lowerUrlPath.endsWith('.vtt') ||
+      finalUrl.split('?')[0].toLowerCase().endsWith('.vtt') ||
+      contentType.includes('vtt')
+    ) {
+      responseHeaders['Content-Type'] = 'text/vtt; charset=utf-8';
+    } else if (
+      lowerUrlPath.endsWith('.srt') ||
+      finalUrl.split('?')[0].toLowerCase().endsWith('.srt') ||
+      contentType.includes('subrip')
+    ) {
+      responseHeaders['Content-Type'] = 'text/plain; charset=utf-8';
+    } else if (isMpd) {
       responseHeaders['Content-Type'] = 'application/dash+xml';
+    } else if (isM3u8) {
+      responseHeaders['Content-Type'] = 'application/vnd.apple.mpegurl';
     } else if (
       !contentType ||
       contentType.includes('octet-stream') ||
@@ -405,6 +466,14 @@ export async function handler(event) {
       responseHeaders['Content-Type'] = String(
         upstream.headers['content-type'],
       );
+    }
+
+    if (isHeadRequest) {
+      return {
+        statusCode: upstream.status,
+        headers: responseHeaders,
+        body: '',
+      };
     }
 
     return {

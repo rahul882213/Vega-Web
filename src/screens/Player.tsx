@@ -49,6 +49,7 @@ import {
 } from '../lib/storage';
 import {EpisodeLink, Stream} from '../lib/providers/types';
 import {QualityOption} from '../components/PlayerSourceMenu';
+import {proxyFetch} from '../lib/sandbox/sandboxRuntime';
 
 interface AudioTrackItem {
   id: number;
@@ -116,8 +117,12 @@ function formatLang(code?: string, fallback = 'Unknown'): string {
 
 function convertSrtToVtt(srtText: string): string {
   const cleaned = srtText
+    .replace(/^\uFEFF/, '')
     .replace(/\r+/g, '')
-    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+    .replace(/(\d{1,2}:\d{2}:\d{2}),(\d{3})/g, (_, hms, ms) => {
+      const padded = hms.length === 7 ? `0${hms}` : hms;
+      return `${padded}.${ms}`;
+    });
   return `WEBVTT\n\n${cleaned}`;
 }
 
@@ -144,6 +149,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [episodeIndex, setEpisodeIndex] = useState<number>(
     routeParams.episodeIndex || 0,
   );
+  useEffect(() => {
+    setEpisodeIndex(routeParams.episodeIndex || 0);
+  }, [routeParams.episodeIndex, routeParams.linkList]);
+
   const activeEpisode: EpisodeLink | null =
     routeParams.linkList?.[episodeIndex] || routeParams.linkList?.[0] || null;
 
@@ -205,9 +214,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() =>
     isRemoteTranscodeHost ? remoteBackendBase : '',
   );
-  const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(() =>
-    typeof window !== 'undefined' &&
-    window.location.hostname.endsWith('github.io'),
+  const [useRemoteProxyFallback, setUseRemoteProxyFallback] = useState(
+    () => isRemoteTranscodeHost,
   );
   const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
@@ -357,10 +365,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setProbedVideoCodec('');
     setVideoDimensions(null);
     setSelectedAudioTrackId(0);
-    setUseRemoteProxyFallback(
-      typeof window !== 'undefined' &&
-        window.location.hostname.endsWith('github.io'),
-    );
+    setSelectedSubtitleId('off');
+    setActiveVttBlobUrl(null);
+    setUseRemoteProxyFallback(isRemoteTranscodeHost);
     setUseRawUrlFallback(false);
 
     // Check saved resume position
@@ -533,9 +540,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   }, [probedSubTracks, externalSubs]);
 
   const streamProxyBase =
-    useRemoteProxyFallback ||
-    (typeof window !== 'undefined' &&
-      window.location.hostname.endsWith('github.io'))
+    useRemoteProxyFallback || isRemoteTranscodeHost
       ? remoteBackendBase
       : apiBaseUrl || '';
 
@@ -718,6 +723,23 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       const hls = new Hls({
         enableWorker: true,
         backBufferLength: 60,
+        xhrSetup: (xhr, reqUrl) => {
+          if (
+            reqUrl &&
+            !reqUrl.startsWith('blob:') &&
+            !reqUrl.includes('/api/stream-proxy')
+          ) {
+            const params = new URLSearchParams({url: reqUrl});
+            if (encodedStreamHeaders) {
+              params.set('headers', encodedStreamHeaders);
+            }
+            xhr.open(
+              'GET',
+              `${streamProxyBase}/api/stream-proxy?${params.toString()}`,
+              true,
+            );
+          }
+        },
       });
       hlsRef.current = hls;
 
@@ -861,10 +883,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           if (encodedStreamHeaders) {
             subParams.set('headers', encodedStreamHeaders);
           }
-          const isGhPages =
-            typeof window !== 'undefined' &&
-            window.location.hostname.endsWith('github.io');
-          const bases = isGhPages
+          const bases = isRemoteTranscodeHost
             ? [remoteBackendBase, '']
             : ['', remoteBackendBase];
           for (const base of bases) {
@@ -873,13 +892,36 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                 `${base}/api/stream-proxy?${subParams.toString()}`,
               );
               if (res.ok) {
-                subText = await res.text();
-                if (subText && !subText.trimStart().startsWith('<!doctype')) {
+                const candidate = await res.text();
+                if (
+                  candidate &&
+                  !candidate.trimStart().toLowerCase().startsWith('<!doctype') &&
+                  !candidate.trimStart().toLowerCase().startsWith('<html')
+                ) {
+                  subText = candidate;
                   break;
                 }
               }
             } catch {
               // Try next base
+            }
+          }
+          if (!subText) {
+            try {
+              const proxiedSub = await proxyFetch('subtitle', track.uri, {
+                method: 'GET',
+                headers: selectedStream?.headers,
+              });
+              if (
+                proxiedSub.status >= 200 &&
+                proxiedSub.status < 300 &&
+                proxiedSub.bodyText &&
+                !proxiedSub.bodyText.trimStart().toLowerCase().startsWith('<html')
+              ) {
+                subText = proxiedSub.bodyText;
+              }
+            } catch {
+              // Ignore subtitle proxy fallback failure
             }
           }
         }
@@ -1233,11 +1275,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Absolute proxy URL for external players (VLC, MX Player, Outplayer, etc.)
   const absoluteDirectStreamUrl = useMemo(() => {
     if (!selectedStream?.link) return '';
-    const originBase =
-      typeof window !== 'undefined' &&
-      window.location.hostname.endsWith('github.io')
-        ? remoteBackendBase
-        : window.location.origin;
+    const originBase = isRemoteTranscodeHost
+      ? remoteBackendBase
+      : window.location.origin;
     if (selectedStream.link.startsWith('http')) {
       const hasCustomHeaders = Boolean(encodedStreamHeaders);
       if (!hasCustomHeaders) return selectedStream.link;
@@ -1396,10 +1436,33 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           }
           const switched = switchToNextStream();
           if (!switched) {
+            const failedStreamLink = selectedStream?.link;
+            const failedResolvedUrl = resolvedVideoUrl;
             setPlaybackError(
               'Stream failed to load or format is unsupported. Try switching server or opening in an external player.',
             );
             setIsBuffering(false);
+            if (failedResolvedUrl && !failedResolvedUrl.startsWith('blob:')) {
+              fetch(failedResolvedUrl, {headers: {Range: 'bytes=0-1'}})
+                .then(async res => {
+                  if (res.status >= 400) {
+                    const detail = (await res.text().catch(() => '')).slice(0, 140);
+                    setPlaybackError(prev => {
+                      if (!prev || selectedStream?.link !== failedStreamLink) {
+                        return prev;
+                      }
+                      if (res.status === 426) {
+                        return `Proxy returned HTTP 426 (HTTP/2 required at ${streamProxyBase || 'backend'}). Redeploy your remote backend or update the Remote Backend URL in Settings.`;
+                      }
+                      if (res.status === 415) {
+                        return 'Upstream returned an HTML webpage instead of a playable video stream. Try another server.';
+                      }
+                      return `Stream failed with HTTP ${res.status}${detail ? `: ${detail}` : ''}`;
+                    });
+                  }
+                })
+                .catch(() => {});
+            }
           }
         }}>
         {activeVttBlobUrl && (

@@ -1,6 +1,0 @@
-{
-  "name": "Vega",
-  "description": "Modular media discovery, provider extension runtime, and streaming player for web browsers.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

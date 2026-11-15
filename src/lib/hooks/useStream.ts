@@ -1,5 +1,5 @@
 import {useQuery} from '@tanstack/react-query';
-import {useState, useEffect, useCallback} from 'react';
+import {useState, useEffect, useCallback, useRef} from 'react';
 import {EpisodeLink, Stream} from '../providers/types';
 import {providerManager} from '../services/ProviderManager';
 import {settingsStorage} from '../storage';
@@ -27,8 +27,8 @@ interface UseStreamOptions {
   enabled?: boolean;
 }
 
-function isLikelyWebpageUrl(rawUrl: string): boolean {
-  const lower = rawUrl.toLowerCase();
+export function isLikelyWebpageUrl(rawUrl: string): boolean {
+  const lower = (rawUrl || '').toLowerCase();
   if (!lower) return true;
   if (lower.includes('/how2download')) return true;
   if (lower.includes('#dl')) return true;
@@ -48,7 +48,11 @@ function scoreStreamCandidate(item: Stream): number {
     serverLower.includes('xcloud') ||
     serverLower === 'gp'
   ) {
-    if (!linkLower.includes('.mp4') && !linkLower.includes('.m3u8') && !linkLower.includes('.mpd')) {
+    if (
+      !linkLower.includes('.mp4') &&
+      !linkLower.includes('.m3u8') &&
+      !linkLower.includes('.mpd')
+    ) {
       score += 40;
     }
   }
@@ -70,27 +74,63 @@ function scoreStreamCandidate(item: Stream): number {
   return score;
 }
 
+function qualityRank(q?: string): number {
+  const n = Number(String(q || '').replace(/p$/i, ''));
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (n === 720) return 4;
+  if (n === 1080) return 3;
+  if (n === 480) return 2;
+  if (n === 2160) return 2;
+  if (n === 360) return 1;
+  return 1;
+}
+
+function pickBestInitialStreamIndex(list: Stream[]): number {
+  if (!list || list.length === 0) return -1;
+  let bestIdx = 0;
+  for (let i = 1; i < list.length; i++) {
+    const cur = list[i];
+    const best = list[bestIdx];
+    const scoreDiff = scoreStreamCandidate(cur) - scoreStreamCandidate(best);
+    if (scoreDiff < 0) {
+      bestIdx = i;
+    } else if (scoreDiff === 0 && qualityRank(cur.quality) > qualityRank(best.quality)) {
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
 export const useStream = ({
   activeEpisode,
   routeParams,
   provider,
   enabled = true,
 }: UseStreamOptions) => {
-  const [selectedStream, setSelectedStream] = useState<Stream>({
+  const [selectedStream, setSelectedStreamState] = useState<Stream>({
     server: '',
     link: '',
     type: '',
   });
+  const [selectedStreamIndex, setSelectedStreamIndex] = useState<number>(-1);
+  const [streamSelectionRevision, setStreamSelectionRevision] = useState<number>(0);
   const [externalSubs, setExternalSubs] = useState<
     {title: string; language: string; type: any; uri: string}[]
   >([]);
+
+  const triedIndicesRef = useRef<Set<number>>(new Set());
+  const isManualSelectionRef = useRef<boolean>(false);
 
   const effectiveProvider = routeParams?.providerValue || provider;
   const effectiveAuthor = routeParams?.sourceAuthor;
 
   // Immediately clear stale stream state when episode/source changes so previous movie URLs are never reused
   useEffect(() => {
-    setSelectedStream({server: '', link: '', type: ''});
+    triedIndicesRef.current = new Set();
+    isManualSelectionRef.current = false;
+    setSelectedStreamState({server: '', link: '', type: ''});
+    setSelectedStreamIndex(-1);
+    setStreamSelectionRevision(r => r + 1);
     setExternalSubs([]);
   }, [activeEpisode?.link, effectiveProvider, routeParams?.file]);
 
@@ -132,8 +172,11 @@ export const useStream = ({
         sourceAuthor: effectiveAuthor,
       });
 
+      // Preserve every valid server entry returned by the provider without dropping webpage/download links or duplicate server names
       const normalizedData = (rawData || [])
-        .filter(item => item && typeof item.link === 'string' && item.link.trim() !== '')
+        .filter(
+          item => item && typeof item.link === 'string' && item.link.trim() !== '',
+        )
         .map(item => {
           const cleanLink = item.link.trim();
           const cleanServer = (item.server || 'Server')
@@ -170,45 +213,14 @@ export const useStream = ({
           };
         });
 
-      // Drop obvious HTML instruction/landing pages whenever real stream candidates exist
-      const mediaCandidates = normalizedData.filter(
-        item => !isLikelyWebpageUrl(item.link),
-      );
-      const validPool =
-        mediaCandidates.length > 0
-          ? mediaCandidates
-          : normalizedData.filter(
-              item => !item.link.toLowerCase().includes('/how2download'),
-            );
-
-      const finalPool = validPool.length > 0 ? validPool : normalizedData;
-
-      // Prioritize direct playable media streams over webpage / download-only candidates;
-      // within identical candidate score tiers (e.g. MovieBox 360/480/720/1080), prefer 720p -> 1080p -> 480p -> 360p
-      const qualityRank = (q?: string): number => {
-        const n = Number(String(q || '').replace(/p$/i, ''));
-        if (!Number.isFinite(n) || n <= 0) return 0;
-        if (n === 720) return 4;
-        if (n === 1080) return 3;
-        if (n === 480) return 2;
-        if (n === 2160) return 2;
-        if (n === 360) return 1;
-        return 1;
-      };
-      finalPool.sort((a, b) => {
-        const scoreDiff = scoreStreamCandidate(a) - scoreStreamCandidate(b);
-        if (scoreDiff !== 0) return scoreDiff;
-        return qualityRank(b.quality) - qualityRank(a.quality);
-      });
-
       const excludedQualities = settingsStorage.getExcludedQualities() || [];
-      const filteredQualities = finalPool.filter(
+      const filteredQualities = normalizedData.filter(
         streamItem =>
           !streamItem.quality ||
           !excludedQualities.includes(streamItem.quality + 'p'),
       );
       const filteredData =
-        filteredQualities.length > 0 ? filteredQualities : finalPool;
+        filteredQualities.length > 0 ? filteredQualities : normalizedData;
 
       if (!filteredData || filteredData.length === 0) {
         throw new Error('No Streams Available');
@@ -231,7 +243,13 @@ export const useStream = ({
 
   useEffect(() => {
     if (streamData && streamData.length > 0) {
-      setSelectedStream(streamData[0]);
+      const initialIndex = pickBestInitialStreamIndex(streamData);
+      const chosenIndex = initialIndex >= 0 ? initialIndex : 0;
+      triedIndicesRef.current = new Set([chosenIndex]);
+      isManualSelectionRef.current = false;
+      setSelectedStreamIndex(chosenIndex);
+      setSelectedStreamState(streamData[chosenIndex]);
+      setStreamSelectionRevision(r => r + 1);
 
       const subs: {title: string; language: string; type: any; uri: string}[] =
         [];
@@ -242,34 +260,96 @@ export const useStream = ({
       });
       setExternalSubs(subs);
     } else {
-      setSelectedStream({server: '', link: '', type: ''});
+      triedIndicesRef.current = new Set();
+      isManualSelectionRef.current = false;
+      setSelectedStreamIndex(-1);
+      setSelectedStreamState({server: '', link: '', type: ''});
       setExternalSubs([]);
     }
   }, [streamData]);
 
+  const setSelectedStream = useCallback(
+    (stream: Stream, explicitIndex?: number) => {
+      let resolvedIndex = -1;
+      if (
+        typeof explicitIndex === 'number' &&
+        explicitIndex >= 0 &&
+        explicitIndex < streamData.length
+      ) {
+        resolvedIndex = explicitIndex;
+      } else {
+        resolvedIndex = streamData.findIndex(
+          s => s.link === stream.link && s.server === stream.server,
+        );
+      }
+      isManualSelectionRef.current = true;
+      triedIndicesRef.current =
+        resolvedIndex >= 0 ? new Set([resolvedIndex]) : new Set();
+      setSelectedStreamIndex(resolvedIndex);
+      setSelectedStreamState(stream);
+      setStreamSelectionRevision(r => r + 1);
+    },
+    [streamData],
+  );
+
   const switchToNextStream = useCallback((): boolean => {
+    if (isManualSelectionRef.current) {
+      // Do not override a user-selected server; let the error overlay allow manual switching
+      return false;
+    }
     if (!streamData || streamData.length <= 1) {
       return false;
     }
-    const currentIndex = streamData.findIndex(
-      s => s.link === selectedStream.link && s.server === selectedStream.server,
+
+    const currentIdx =
+      selectedStreamIndex >= 0 && selectedStreamIndex < streamData.length
+        ? selectedStreamIndex
+        : streamData.findIndex(
+            s => s.link === selectedStream.link && s.server === selectedStream.server,
+          );
+
+    if (currentIdx >= 0) {
+      triedIndicesRef.current.add(currentIdx);
+    }
+
+    // Build ordered candidate indices starting right after currentIdx
+    const orderedCandidates: number[] = [];
+    for (let offset = 1; offset <= streamData.length; offset++) {
+      const idx =
+        currentIdx >= 0
+          ? (currentIdx + offset) % streamData.length
+          : offset - 1;
+      if (!triedIndicesRef.current.has(idx)) {
+        orderedCandidates.push(idx);
+      }
+    }
+
+    // Prefer untried non-webpage media streams during auto-fallback
+    const nextIdx = orderedCandidates.find(
+      idx => !isLikelyWebpageUrl(streamData[idx].link),
     );
-    if (currentIndex !== -1 && currentIndex + 1 < streamData.length) {
-      const next = streamData[currentIndex + 1];
-      setSelectedStream(next);
+
+    if (nextIdx !== undefined) {
+      triedIndicesRef.current.add(nextIdx);
+      setSelectedStreamIndex(nextIdx);
+      setSelectedStreamState(streamData[nextIdx]);
+      setStreamSelectionRevision(r => r + 1);
       return true;
     }
+
     showAppDialog({
       title: 'Video could not be played',
-      message: 'All available servers failed. Please try another source.',
+      message: 'All playable servers failed. Choose another server or external player.',
       variant: 'error',
     });
     return false;
-  }, [streamData, selectedStream]);
+  }, [streamData, selectedStream, selectedStreamIndex]);
 
   return {
     stream: streamData,
     selectedStream,
+    selectedStreamIndex,
+    streamSelectionRevision,
     setSelectedStream,
     externalSubs,
     setExternalSubs,

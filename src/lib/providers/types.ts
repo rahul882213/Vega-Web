@@ -31,6 +31,7 @@ export interface Stream {
   quality?: '360' | '480' | '720' | '1080' | '2160' | string;
   subtitles?: TextTracks;
   headers?: any;
+  tag?: string;
   tags?: string[];
   skip?: SkipInterval[];
 }

@@ -39,7 +39,7 @@ import {useM3Colors} from '../theme/M3PaletteContext';
 import {useVegaNavigation, PlayerRouteParams} from '../NavigationContext';
 import useContentStore from '../lib/zustand/contentStore';
 import useContinueWatchingStore from '../lib/zustand/continueWatchingStore';
-import {useStream} from '../lib/hooks/useStream';
+import {useStream, isLikelyWebpageUrl} from '../lib/hooks/useStream';
 import {
   settingsStorage,
   cacheStorage,
@@ -159,6 +159,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const {
     stream: streams,
     selectedStream,
+    selectedStreamIndex,
+    streamSelectionRevision,
     setSelectedStream,
     externalSubs,
     setExternalSubs,
@@ -218,6 +220,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     () => isRemoteTranscodeHost,
   );
   const [useRawUrlFallback, setUseRawUrlFallback] = useState(false);
+  const triedDecoderStagesRef = useRef<Set<string>>(new Set());
   const [probedAudioTracks, setProbedAudioTracks] = useState<AudioTrackItem[]>([]);
   const [probedSubTracks, setProbedSubTracks] = useState<SubtitleTrackItem[]>([]);
   const [probedResolution, setProbedResolution] = useState<string>('');
@@ -354,6 +357,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Reset per-stream state and probe stream metadata via ffprobe
   useEffect(() => {
     const rawLink = selectedStream?.link?.trim() || '';
+    triedDecoderStagesRef.current = new Set();
     setPlaybackError(null);
     setRawVideoTime(0);
     setRawVideoDuration(0);
@@ -515,6 +519,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   }, [
     selectedStream?.link,
     selectedStream?.server,
+    selectedStreamIndex,
+    streamSelectionRevision,
     encodedStreamHeaders,
     isHlsStream,
     isDashStream,
@@ -848,7 +854,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         dashRef.current = null;
       }
     };
-  }, [resolvedVideoUrl]);
+  }, [resolvedVideoUrl, streamSelectionRevision]);
 
   // Load and convert selected subtitle into WebVTT blob URL
   useEffect(() => {
@@ -1390,56 +1396,76 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           }
         }}
         onError={() => {
-          // Automatic decoder & proxy fallback chain:
-          if (
-            decoderMode === 'direct' &&
-            !useRemoteProxyFallback &&
-            !isLocalBlob
-          ) {
-            setUseRemoteProxyFallback(true);
-            return;
+          const isWebpageCandidate = isLikelyWebpageUrl(selectedStream?.link || '');
+          const tried = triedDecoderStagesRef.current;
+
+          if (!isWebpageCandidate) {
+            if (
+              decoderMode === 'direct' &&
+              !useRemoteProxyFallback &&
+              !isLocalBlob &&
+              !tried.has('remote')
+            ) {
+              tried.add('remote');
+              setUseRemoteProxyFallback(true);
+              return;
+            }
+            if (
+              decoderMode === 'direct' &&
+              transcodeAvailable === true &&
+              !isLocalBlob &&
+              !isHlsStream &&
+              !isDashStream &&
+              !tried.has('hw')
+            ) {
+              tried.add('hw');
+              setTranscodeOffset(Math.floor(currentTime));
+              setDecoderMode('hw');
+              showToast('Switching to HW Remux Decoder...');
+              return;
+            }
+            if (
+              decoderMode !== 'sw' &&
+              transcodeAvailable === true &&
+              !isLocalBlob &&
+              !isHlsStream &&
+              !isDashStream &&
+              !tried.has('sw')
+            ) {
+              tried.add('sw');
+              setTranscodeOffset(Math.floor(currentTime));
+              setDecoderMode('sw');
+              showToast('Switching to SW H.264 Decoder...');
+              return;
+            }
+            if (decoderMode !== 'direct' && !tried.has('direct-reset')) {
+              tried.add('direct-reset');
+              setTranscodeOffset(0);
+              setDecoderMode('direct');
+              setUseRemoteProxyFallback(true);
+              showToast('Switching to Direct Stream...');
+              return;
+            }
+            if (
+              !useRawUrlFallback &&
+              !encodedStreamHeaders &&
+              !isLocalBlob &&
+              !tried.has('raw')
+            ) {
+              tried.add('raw');
+              setUseRawUrlFallback(true);
+              return;
+            }
           }
-          if (
-            decoderMode === 'direct' &&
-            transcodeAvailable === true &&
-            !isLocalBlob &&
-            !isHlsStream &&
-            !isDashStream
-          ) {
-            setTranscodeOffset(Math.floor(currentTime));
-            setDecoderMode('hw');
-            showToast('Switching to HW Remux Decoder...');
-            return;
-          }
-          if (
-            decoderMode === 'hw' &&
-            transcodeAvailable === true &&
-            !isLocalBlob &&
-            !isHlsStream &&
-            !isDashStream
-          ) {
-            setTranscodeOffset(Math.floor(currentTime));
-            setDecoderMode('sw');
-            showToast('Switching to SW H.264 Decoder...');
-            return;
-          }
-          if (decoderMode !== 'direct') {
-            setTranscodeOffset(0);
-            setDecoderMode('direct');
-            setUseRemoteProxyFallback(true);
-            showToast('Switching to Direct Stream...');
-            return;
-          }
-          if (!useRawUrlFallback && !encodedStreamHeaders && !isLocalBlob) {
-            setUseRawUrlFallback(true);
-            return;
-          }
+
           const switched = switchToNextStream();
           if (!switched) {
             const failedStreamLink = selectedStream?.link;
             const failedResolvedUrl = resolvedVideoUrl;
             setPlaybackError(
-              'Stream failed to load or format is unsupported. Try switching server or opening in an external player.',
+              isWebpageCandidate
+                ? 'This server links to an HTML download/instruction page instead of a direct video stream. Switch server or open externally.'
+                : 'Stream failed to load or format is unsupported. Try switching server or opening in an external player.',
             );
             setIsBuffering(false);
             if (failedResolvedUrl && !failedResolvedUrl.startsWith('blob:')) {
@@ -2077,16 +2103,32 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                     <h4 className="text-center text-white text-lg font-bold mb-4">
                       Server
                     </h4>
-                    <div className="space-y-2.5 overflow-y-auto pr-0.5">
+                    <div className="space-y-2.5 overflow-y-auto pr-0.5 max-h-[48vh]">
                       {streams.map((item, idx) => {
                         const selected =
-                          item.link === selectedStream.link &&
-                          item.server === selectedStream.server;
+                          selectedStreamIndex >= 0
+                            ? idx === selectedStreamIndex
+                            : item.link === selectedStream.link &&
+                              item.server === selectedStream.server;
+                        const serverLabel = item.server || `Server ${idx + 1}`;
+                        const qualityText =
+                          item.quality &&
+                          !serverLabel
+                            .toLowerCase()
+                            .includes(String(item.quality).toLowerCase())
+                            ? `${item.quality}p`
+                            : null;
+                        const metaParts = [
+                          qualityText,
+                          item.tag || null,
+                          ...(item.tags || []),
+                        ].filter(Boolean);
                         return (
                           <button
-                            key={`${idx}:${item.link}`}
+                            key={`${idx}:${item.server}:${item.link}`}
                             onClick={() => {
-                              setSelectedStream(item);
+                              setPlaybackError(null);
+                              setSelectedStream(item, idx);
                               setSettingsOpen(false);
                             }}
                             className={`w-full px-4 py-3.5 rounded-2xl text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
@@ -2099,9 +2141,16 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                                 size={20}
                                 className="text-white/90 shrink-0"
                               />
-                              <span className="text-sm font-bold text-white truncate">
-                                {item.server || `Server ${idx + 1}`}
-                              </span>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-bold text-white truncate">
+                                  {serverLabel}
+                                </p>
+                                {metaParts.length > 0 && (
+                                  <p className="text-[11px] text-white/55 truncate mt-0.5">
+                                    {metaParts.join(' · ')}
+                                  </p>
+                                )}
+                              </div>
                             </div>
                             {selected && (
                               <span className="w-6 h-6 rounded-full bg-white flex items-center justify-center shrink-0">

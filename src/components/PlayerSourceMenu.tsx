@@ -13,10 +13,11 @@ interface PlayerSourceMenuProps {
   visible: boolean;
   streams: Stream[];
   selectedStream: Stream;
+  selectedStreamIndex?: number;
   isLoading: boolean;
   qualityOptions: QualityOption[];
   selectedQualityId: number;
-  onSelectStream: (stream: Stream) => void;
+  onSelectStream: (stream: Stream, index?: number) => void;
   onSelectQuality: (levelId: number) => void;
   onPickLocalFile: (file: File) => void;
   onClose: () => void;
@@ -26,6 +27,7 @@ export const PlayerSourceMenu: React.FC<PlayerSourceMenuProps> = ({
   visible,
   streams,
   selectedStream,
+  selectedStreamIndex = -1,
   isLoading,
   qualityOptions,
   selectedQualityId,
@@ -88,19 +90,22 @@ export const PlayerSourceMenu: React.FC<PlayerSourceMenuProps> = ({
               ) : (
                 streams.map((item, i) => {
                   const isSelected =
-                    item.link === selectedStream.link &&
-                    item.server === selectedStream.server;
+                    selectedStreamIndex >= 0
+                      ? i === selectedStreamIndex
+                      : item.link === selectedStream.link &&
+                        item.server === selectedStream.server;
                   const metaBadges = [
                     item.quality ? `${item.quality}p` : null,
                     item.type ? item.type.toUpperCase() : null,
+                    item.tag || null,
                     ...(item.tags || []),
                   ].filter(Boolean);
 
                   return (
                     <button
-                      key={`${item.server}-${item.link}-${i}`}
+                      key={`${i}:${item.server}:${item.link}`}
                       onClick={() => {
-                        onSelectStream(item);
+                        onSelectStream(item, i);
                         onClose();
                       }}
                       className="w-full p-3 rounded-2xl border text-left flex items-center justify-between gap-2 transition-colors cursor-pointer"

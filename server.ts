@@ -1517,7 +1517,7 @@ async function startServer() {
   }
 
   function isRetryableStreamStatus(status: number, isH2Cdn: boolean): boolean {
-    if (status === 426 || status === 428) return true;
+    if (status === 426 || status === 427 || status === 428) return true;
     if (isH2Cdn && (status === 403 || status === 429)) return true;
     return false;
   }

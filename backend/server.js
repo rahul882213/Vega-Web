@@ -53,19 +53,19 @@ const FALLBACK_LIVE_MIRRORS = {
   movielinkdb: {name: 'movielinkbd', url: 'https://y85rfw.movielinkbd.at'},
 };
 
-function checkBinaryAvailable(bin) {
+function checkBinaryAvailable(bin, flag = '-version') {
   try {
-    execFileSync(bin, ['-version'], {stdio: 'ignore', timeout: 3000});
+    execFileSync(bin, [flag], {stdio: 'ignore', timeout: 3000});
     return true;
   } catch {
     return false;
   }
 }
 
-const FFMPEG_AVAILABLE = checkBinaryAvailable('ffmpeg');
-const FFPROBE_AVAILABLE = checkBinaryAvailable('ffprobe');
-const WIREPROXY_AVAILABLE = checkBinaryAvailable('wireproxy');
-const TOR_AVAILABLE = checkBinaryAvailable('tor');
+const FFMPEG_AVAILABLE = checkBinaryAvailable('ffmpeg', '-version');
+const FFPROBE_AVAILABLE = checkBinaryAvailable('ffprobe', '-version');
+const WIREPROXY_AVAILABLE = checkBinaryAvailable('wireproxy', '-version');
+const TOR_AVAILABLE = checkBinaryAvailable('tor', '--version');
 const ENV_STREAM_PROXY_URL = String(process.env.STREAM_PROXY_URL || '').trim();
 
 async function resolvePortalUrl(portalUrl, pattern, fallbackUrl) {
@@ -441,6 +441,8 @@ async function ensureTorTunnel() {
       const torrcPath = `${torDir}/torrc`;
       const torrc = [
         'SocksPort 19050',
+        'ControlPort 19051',
+        'CookieAuthentication 0',
         `DataDirectory ${torDir}`,
         'ExitNodes {sg},{jp},{in},{hk},{tw},{nl},{de},{fr},{gb}',
         'StrictNodes 1',
@@ -486,6 +488,35 @@ async function ensureTorTunnel() {
   })();
 
   return torTunnelPromise;
+}
+
+async function rotateTorExit() {
+  if (!TOR_AVAILABLE) return false;
+  try {
+    const net = await import('net');
+    return await new Promise(resolve => {
+      const sock = new net.Socket();
+      let done = false;
+      const finish = ok => {
+        if (done) return;
+        done = true;
+        try {
+          sock.destroy();
+        } catch {}
+        resolve(ok);
+      };
+      sock.setTimeout(2500);
+      sock.once('connect', () => {
+        sock.write('AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n');
+      });
+      sock.once('data', () => finish(true));
+      sock.once('timeout', () => finish(false));
+      sock.once('error', () => finish(false));
+      sock.connect(19051, '127.0.0.1');
+    });
+  } catch {
+    return false;
+  }
 }
 
 async function getAvailableProxyTunnels() {
@@ -821,7 +852,7 @@ function startBackend() {
       ok: true,
       status: 'healthy',
       service: 'vega-web-backend',
-      version: '2.2.0',
+      version: '2.2.1',
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
       ffmpegAvailable: FFMPEG_AVAILABLE,
@@ -1179,6 +1210,7 @@ function startBackend() {
         if (
           !response ||
           response.status === 426 ||
+          response.status === 427 ||
           response.status === 428 ||
           response.status === 403 ||
           response.status === 429
@@ -1202,12 +1234,19 @@ function startBackend() {
         }
       }
 
-      if (!response || response.status === 426 || response.status === 428) {
+      if (
+        !response ||
+        response.status === 426 ||
+        response.status === 427 ||
+        response.status === 428
+      ) {
         try {
           const axiosRes = await fetchProxyViaHttp1();
           if (
             !response ||
-            (axiosRes.status !== 426 && axiosRes.status !== 428)
+            (axiosRes.status !== 426 &&
+              axiosRes.status !== 427 &&
+              axiosRes.status !== 428)
           ) {
             response = axiosRes;
           }
@@ -1215,7 +1254,10 @@ function startBackend() {
           // Keep previous response if any
         }
         if (
-          (!response || response.status === 426 || response.status === 428) &&
+          (!response ||
+            response.status === 426 ||
+            response.status === 427 ||
+            response.status === 428) &&
           !isKnownH2Host
         ) {
           try {
@@ -1238,6 +1280,7 @@ function startBackend() {
       if (
         !response ||
         response.status === 426 ||
+        response.status === 427 ||
         response.status === 428 ||
         (isKnownH2Host && (response.status === 403 || response.status === 429))
       ) {
@@ -1252,6 +1295,7 @@ function startBackend() {
           if (
             !candidate ||
             candidate.status === 426 ||
+            candidate.status === 427 ||
             candidate.status === 428
           ) {
             try {
@@ -1286,6 +1330,7 @@ function startBackend() {
       if (
         !response ||
         response.status === 426 ||
+        response.status === 427 ||
         response.status === 428 ||
         (isKnownH2Host && (response.status === 403 || response.status === 429))
       ) {
@@ -1977,7 +2022,7 @@ function startBackend() {
   }
 
   function isRetryableStreamStatus(status, isH2Cdn) {
-    if (status === 426 || status === 428) return true;
+    if (status === 426 || status === 427 || status === 428) return true;
     if (isH2Cdn && (status === 403 || status === 429)) return true;
     return false;
   }
@@ -2059,6 +2104,7 @@ function startBackend() {
       if (
         !lastResult ||
         lastResult.status === 426 ||
+        lastResult.status === 427 ||
         lastResult.status === 428
       ) {
         const h2Hit = await tryCandidate('h2', '');
@@ -2066,10 +2112,10 @@ function startBackend() {
       }
     }
 
-    // 3. Round-robin DoH GeoDNS PoP cascade when direct edge returns 426/428/403/429
+    // 3. Round-robin DoH GeoDNS PoP cascade when direct edge returns 426/427/428/403/429
     if (!lastResult || isRetryableStreamStatus(lastResult.status, isH2Cdn)) {
       const altIps = await resolveAlternateEdgeIps(parsed.hostname);
-      for (const ip of altIps.slice(0, 10)) {
+      for (const ip of altIps.slice(0, 4)) {
         const h1Alt = await tryCandidate('h1', ip);
         if (h1Alt) return h1Alt;
         const h2Alt = await tryCandidate('h2', ip);
@@ -2085,6 +2131,13 @@ function startBackend() {
         if (h1Tunnel) return h1Tunnel;
         const h2Tunnel = await tryCandidate('h2', '', proxyUrl);
         if (h2Tunnel) return h2Tunnel;
+        if (proxyUrl.includes(':19050') && (await rotateTorExit())) {
+          await new Promise(r => setTimeout(r, 1500));
+          const h1Rotated = await tryCandidate('h1', '', proxyUrl);
+          if (h1Rotated) return h1Rotated;
+          const h2Rotated = await tryCandidate('h2', '', proxyUrl);
+          if (h2Rotated) return h2Rotated;
+        }
       }
     }
 

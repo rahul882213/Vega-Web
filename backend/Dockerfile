@@ -1,9 +1,15 @@
 FROM node:20-slim
 
-# Install ffmpeg and ffprobe for MKV/HEVC/EAC3 probing, subtitle extraction, and live remuxing
+# Install ffmpeg, ffprobe, curl, and tor for MKV/HEVC probing, subtitle extraction, live remuxing, and non-US tunnel fallback
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl tor \
+  && rm -rf /var/lib/apt/lists/* \
+  && ARCH=$(dpkg --print-architecture) \
+  && WP_ARCH=$([ "$ARCH" = "arm64" ] && echo "arm64" || echo "amd64") \
+  && curl -fsSL "https://github.com/pufferffish/wireproxy/releases/download/v1.1.3/wireproxy_linux_${WP_ARCH}.tar.gz" -o /tmp/wireproxy.tar.gz \
+  && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+  && chmod +x /usr/local/bin/wireproxy \
+  && rm -f /tmp/wireproxy.tar.gz
 
 WORKDIR /app
 

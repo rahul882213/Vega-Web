@@ -6,7 +6,11 @@ import express from 'express';
 import axios from 'axios';
 import https from 'https';
 import http2 from 'http2';
+import tls from 'tls';
+import fs from 'fs';
 import dns from 'dns';
+import {SocksClient} from 'socks';
+import {SocksProxyAgent} from 'socks-proxy-agent';
 
 const execFileAsync = promisify(execFile);
 
@@ -60,6 +64,9 @@ function checkBinaryAvailable(bin) {
 
 const FFMPEG_AVAILABLE = checkBinaryAvailable('ffmpeg');
 const FFPROBE_AVAILABLE = checkBinaryAvailable('ffprobe');
+const WIREPROXY_AVAILABLE = checkBinaryAvailable('wireproxy');
+const TOR_AVAILABLE = checkBinaryAvailable('tor');
+const ENV_STREAM_PROXY_URL = String(process.env.STREAM_PROXY_URL || '').trim();
 
 async function resolvePortalUrl(portalUrl, pattern, fallbackUrl) {
   try {
@@ -257,9 +264,273 @@ function isKnownH2OrCdnHost(targetUrl) {
   );
 }
 
-const workingEdgeIpCache = new Map();
+const workingTransportCache = new Map();
 const alternateEdgeIpsCache = new Map();
 const EDGE_CACHE_TTL_MS = 10 * 60 * 1000;
+const socksAgentCache = new Map();
+
+function getSocksAgent(proxyUrl) {
+  let agent = socksAgentCache.get(proxyUrl);
+  if (!agent) {
+    agent = new SocksProxyAgent(proxyUrl, {
+      keepAlive: true,
+    });
+    socksAgentCache.set(proxyUrl, agent);
+  }
+  return agent;
+}
+
+function parseSocks5Url(proxyUrl) {
+  const u = new URL(proxyUrl);
+  return {
+    host: u.hostname,
+    port: Number(u.port || 1080),
+    type: 5,
+    ...(u.username ? {userId: decodeURIComponent(u.username)} : {}),
+    ...(u.password ? {password: decodeURIComponent(u.password)} : {}),
+  };
+}
+
+let warpTunnelPromise = null;
+let warpTunnelUrl = '';
+let warpTunnelDisabledUntil = 0;
+
+async function isPortAccepting(host, port) {
+  const net = await import('net');
+  return new Promise(resolve => {
+    const sock = new net.Socket();
+    let done = false;
+    const finish = ok => {
+      if (done) return;
+      done = true;
+      try {
+        sock.destroy();
+      } catch {}
+      resolve(ok);
+    };
+    sock.setTimeout(1500);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+    sock.connect(port, host);
+  });
+}
+
+async function ensureWarpTunnel() {
+  if (!WIREPROXY_AVAILABLE) return '';
+  if (warpTunnelUrl && (await isPortAccepting('127.0.0.1', 40000))) {
+    return warpTunnelUrl;
+  }
+  if (Date.now() < warpTunnelDisabledUntil) return '';
+  if (warpTunnelPromise) return warpTunnelPromise;
+
+  warpTunnelPromise = (async () => {
+    try {
+      const confPath = '/tmp/vega-warp.conf';
+      if (!fs.existsSync(confPath)) {
+        const keypair = crypto.generateKeyPairSync('x25519');
+        const privDer = keypair.privateKey.export({
+          type: 'pkcs8',
+          format: 'der',
+        });
+        const pubDer = keypair.publicKey.export({
+          type: 'spki',
+          format: 'der',
+        });
+        const privB64 = privDer.slice(-32).toString('base64');
+        const pubB64 = pubDer.slice(-32).toString('base64');
+
+        const regRes = await axios.post(
+          'https://api.cloudflareclient.com/v0a2158/reg',
+          {
+            key: pubB64,
+            install_id: '',
+            fcm_token: '',
+            tos: new Date().toISOString(),
+            model: 'Linux',
+            serial_number: '',
+            locale: 'en_US',
+          },
+          {
+            timeout: 8000,
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'okhttp/3.12.1',
+              'CF-Client-Version': 'a-6.10-2158',
+            },
+            validateStatus: () => true,
+          },
+        );
+        const peer = regRes.data?.config?.peers?.[0];
+        const v4 = regRes.data?.config?.interface?.addresses?.v4 || '172.16.0.2';
+        if (!peer?.public_key) {
+          warpTunnelDisabledUntil = Date.now() + 5 * 60 * 1000;
+          return '';
+        }
+        let endpoint = String(
+          peer.endpoint?.host || 'engage.cloudflareclient.com:2408',
+        );
+        if (!endpoint.includes(':')) endpoint = `${endpoint}:2408`;
+        const conf = [
+          '[Interface]',
+          `PrivateKey = ${privB64}`,
+          `Address = ${v4}/32`,
+          'DNS = 1.1.1.1',
+          'MTU = 1280',
+          '',
+          '[Peer]',
+          `PublicKey = ${peer.public_key}`,
+          `Endpoint = ${endpoint}`,
+          'KeepAlive = 25',
+          '',
+          '[Socks5]',
+          'BindAddress = 127.0.0.1:40000',
+          '',
+        ].join('\n');
+        fs.writeFileSync(confPath, conf, 'utf8');
+      }
+
+      const wp = spawn('wireproxy', ['-c', confPath], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      wp.unref();
+      wp.on('exit', () => {
+        warpTunnelUrl = '';
+      });
+
+      for (let i = 0; i < 20; i++) {
+        if (await isPortAccepting('127.0.0.1', 40000)) {
+          warpTunnelUrl = 'socks5h://127.0.0.1:40000';
+          return warpTunnelUrl;
+        }
+        await new Promise(r => setTimeout(r, 250));
+      }
+      warpTunnelDisabledUntil = Date.now() + 2 * 60 * 1000;
+      return '';
+    } catch {
+      warpTunnelDisabledUntil = Date.now() + 2 * 60 * 1000;
+      return '';
+    } finally {
+      warpTunnelPromise = null;
+    }
+  })();
+
+  return warpTunnelPromise;
+}
+
+let torTunnelPromise = null;
+let torTunnelUrl = '';
+let torTunnelDisabledUntil = 0;
+
+async function ensureTorTunnel() {
+  if (!TOR_AVAILABLE) return '';
+  if (torTunnelUrl && (await isPortAccepting('127.0.0.1', 19050))) {
+    try {
+      const log = fs.readFileSync('/tmp/vega-tor/tor.log', 'utf8');
+      if (log.includes('Bootstrapped 100%')) return torTunnelUrl;
+    } catch {}
+  }
+  if (Date.now() < torTunnelDisabledUntil) return '';
+  if (torTunnelPromise) return torTunnelPromise;
+
+  torTunnelPromise = (async () => {
+    try {
+      const torDir = '/tmp/vega-tor';
+      fs.mkdirSync(torDir, {recursive: true, mode: 0o700});
+      const logPath = `${torDir}/tor.log`;
+      const torrcPath = `${torDir}/torrc`;
+      const torrc = [
+        'SocksPort 19050',
+        `DataDirectory ${torDir}`,
+        'ExitNodes {sg},{jp},{in},{hk},{tw},{nl},{de},{fr},{gb}',
+        'StrictNodes 1',
+        'CircuitBuildTimeout 15',
+        'LearnCircuitBuildTimeout 0',
+        `Log notice file ${logPath}`,
+        '',
+      ].join('\n');
+      fs.writeFileSync(torrcPath, torrc, 'utf8');
+      try {
+        fs.writeFileSync(logPath, '', 'utf8');
+      } catch {}
+
+      const torProc = spawn('tor', ['-f', torrcPath], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      torProc.unref();
+      torProc.on('exit', () => {
+        torTunnelUrl = '';
+      });
+
+      for (let i = 0; i < 45; i++) {
+        try {
+          const log = fs.readFileSync(logPath, 'utf8');
+          if (
+            log.includes('Bootstrapped 100%') &&
+            (await isPortAccepting('127.0.0.1', 19050))
+          ) {
+            torTunnelUrl = 'socks5h://127.0.0.1:19050';
+            return torTunnelUrl;
+          }
+        } catch {}
+        await new Promise(r => setTimeout(r, 500));
+      }
+      torTunnelDisabledUntil = Date.now() + 60 * 1000;
+      return '';
+    } catch {
+      torTunnelDisabledUntil = Date.now() + 60 * 1000;
+      return '';
+    } finally {
+      torTunnelPromise = null;
+    }
+  })();
+
+  return torTunnelPromise;
+}
+
+async function getAvailableProxyTunnels() {
+  const candidates = [];
+  if (ENV_STREAM_PROXY_URL) {
+    candidates.push(ENV_STREAM_PROXY_URL);
+  }
+  const [warp, tor] = await Promise.all([
+    ensureWarpTunnel(),
+    ensureTorTunnel(),
+  ]);
+  if (warp) candidates.push(warp);
+  if (tor) candidates.push(tor);
+  return candidates;
+}
+
+function mergeCookiesFromSetCookie(existingCookie, setCookieHeader) {
+  const jar = new Map();
+  const addCookieString = str => {
+    for (const part of String(str || '').split(';')) {
+      const eq = part.indexOf('=');
+      if (eq > 0) {
+        const k = part.slice(0, eq).trim();
+        const v = part.slice(eq + 1).trim();
+        if (k) jar.set(k, v);
+      }
+    }
+  };
+  if (existingCookie) addCookieString(existingCookie);
+  const rawList = Array.isArray(setCookieHeader)
+    ? setCookieHeader
+    : setCookieHeader
+      ? [String(setCookieHeader)]
+      : [];
+  for (const sc of rawList) {
+    const firstPart = String(sc).split(';')[0];
+    const eq = firstPart.indexOf('=');
+    if (eq > 0) {
+      jar.set(firstPart.slice(0, eq).trim(), firstPart.slice(eq + 1).trim());
+    }
+  }
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
 
 function createHostScopedLookup(targetHost, overrideIp) {
   return (hostname, options, callback) => {
@@ -302,15 +573,10 @@ async function resolveAlternateEdgeIps(hostname) {
     '103.21.244.0/24', // APAC / HK
     '49.36.0.0/16', // India
     '185.220.100.0/24', // Europe
+    '200.160.0.0/16', // South America
   ];
 
   const results = await Promise.allSettled([
-    ...ecsSubnets.map(subnet =>
-      axios.get(
-        `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A&edns_client_subnet=${encodeURIComponent(subnet)}`,
-        {timeout: 3500, validateStatus: () => true},
-      ),
-    ),
     axios.get(
       `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
       {
@@ -319,22 +585,46 @@ async function resolveAlternateEdgeIps(hostname) {
         validateStatus: () => true,
       },
     ),
+    axios.get(
+      `https://dns.alidns.com/resolve?name=${encodeURIComponent(host)}&type=1`,
+      {timeout: 3500, validateStatus: () => true},
+    ),
+    ...ecsSubnets.map(subnet =>
+      axios.get(
+        `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A&edns_client_subnet=${encodeURIComponent(subnet)}`,
+        {timeout: 3500, validateStatus: () => true},
+      ),
+    ),
   ]);
 
-  const seen = new Set();
-  const ips = [];
+  const buckets = [];
   for (const r of results) {
     if (r.status !== 'fulfilled') continue;
     const answers = Array.isArray(r.value?.data?.Answer)
       ? r.value.data.Answer
       : [];
+    const list = [];
     for (const ans of answers) {
       if (ans?.type === 1 && typeof ans.data === 'string') {
         const ip = ans.data.trim();
-        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && !seen.has(ip)) {
-          seen.add(ip);
-          ips.push(ip);
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+          list.push(ip);
         }
+      }
+    }
+    if (list.length > 0) buckets.push(list);
+  }
+
+  // Round-robin interleave across resolvers so HK/SG/IN/EU PoPs are all represented early
+  const seen = new Set();
+  const ips = [];
+  const maxLen = Math.max(0, ...buckets.map(b => b.length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const bucket of buckets) {
+      const ip = bucket[i];
+      if (ip && !seen.has(ip)) {
+        seen.add(ip);
+        ips.push(ip);
       }
     }
   }
@@ -367,7 +657,7 @@ async function runFfprobeOnInput(inputUrl, headerStr) {
     '-show_format',
     '-show_streams',
     '-rw_timeout',
-    '15000000',
+    '25000000',
   ];
 
   if (headerStr) {
@@ -376,7 +666,7 @@ async function runFfprobeOnInput(inputUrl, headerStr) {
   args.push(inputUrl);
 
   const {stdout} = await execFileAsync('ffprobe', args, {
-    timeout: 18000,
+    timeout: 28000,
     maxBuffer: 8 * 1024 * 1024,
   });
 
@@ -531,11 +821,17 @@ function startBackend() {
       ok: true,
       status: 'healthy',
       service: 'vega-web-backend',
-      version: '2.1.0',
+      version: '2.2.0',
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
       ffmpegAvailable: FFMPEG_AVAILABLE,
       ffprobeAvailable: FFPROBE_AVAILABLE,
+      tunnels: {
+        warpAvailable: WIREPROXY_AVAILABLE,
+        warpReady: Boolean(warpTunnelUrl),
+        torAvailable: TOR_AVAILABLE,
+        torReady: Boolean(torTunnelUrl),
+      },
       allowedOrigins: ALLOWED_ORIGIN_LIST,
     });
   };
@@ -587,6 +883,42 @@ function startBackend() {
           ? Buffer.from(bodyBase64, 'base64')
           : undefined;
 
+      async function createH2Session(targetUrl, overrideIp = '', proxyUrl = '') {
+        const parsed = new URL(targetUrl);
+        if (proxyUrl) {
+          const proxy = parseSocks5Url(proxyUrl);
+          const {socket} = await SocksClient.createConnection({
+            proxy,
+            command: 'connect',
+            destination: {
+              host: parsed.hostname,
+              port: Number(parsed.port || (parsed.protocol === 'http:' ? 80 : 443)),
+            },
+            timeout: 15000,
+          });
+          if (parsed.protocol === 'http:') {
+            return http2.connect(parsed.origin, {
+              createConnection: () => socket,
+            });
+          }
+          const tlsSock = tls.connect({
+            socket,
+            servername: parsed.hostname,
+            ALPNProtocols: ['h2', 'http/1.1'],
+            rejectUnauthorized: false,
+          });
+          return http2.connect(parsed.origin, {
+            createConnection: () => tlsSock,
+          });
+        }
+        return http2.connect(parsed.origin, {
+          rejectUnauthorized: false,
+          ...(overrideIp
+            ? {lookup: createHostScopedLookup(parsed.hostname, overrideIp)}
+            : {}),
+        });
+      }
+
       const fetchProxyViaHttp2 = (
         targetUrl,
         reqMethod,
@@ -595,6 +927,7 @@ function startBackend() {
         redirectMode = 'follow',
         redirectsLeft = 8,
         overrideIp = '',
+        proxyUrl = '',
       ) =>
         new Promise((resolve, reject) => {
           let resolved = false;
@@ -609,172 +942,225 @@ function startBackend() {
             }
           }, Math.min(UPSTREAM_TIMEOUT_MS, 25000));
 
-          try {
-            const parsed = new URL(targetUrl);
-            const connectOpts = {
-              rejectUnauthorized: false,
-              ...(overrideIp
-                ? {lookup: createHostScopedLookup(parsed.hostname, overrideIp)}
-                : {}),
-            };
-            client = http2.connect(parsed.origin, connectOpts);
-            client.on('error', err => {
-              if (!resolved) {
-                resolved = true;
-                clearTimeout(timer);
-                reject(err);
-              }
-            });
+          (async () => {
+            try {
+              const parsed = new URL(targetUrl);
+              client = await createH2Session(targetUrl, overrideIp, proxyUrl);
+              client.on('error', err => {
+                if (!resolved) {
+                  resolved = true;
+                  clearTimeout(timer);
+                  reject(err);
+                }
+              });
 
-            const upperM = String(reqMethod).toUpperCase();
-            const h2Headers = {
-              ':method': upperM,
-              ':scheme': parsed.protocol.replace(':', ''),
-              ':authority': parsed.host,
-              ':path': parsed.pathname + parsed.search,
-            };
+              const upperM = String(reqMethod).toUpperCase();
+              const h2Headers = {
+                ':method': upperM,
+                ':scheme': parsed.protocol.replace(':', ''),
+                ':authority': parsed.host,
+                ':path': parsed.pathname + parsed.search,
+              };
 
-            for (const [k, v] of Object.entries(reqHeaders)) {
-              const lower = k.toLowerCase();
-              if (
-                lower === 'host' ||
-                lower === 'connection' ||
-                lower === 'keep-alive' ||
-                lower === 'transfer-encoding' ||
-                lower === 'upgrade' ||
-                lower === 'http2-settings' ||
-                lower === 'accept-encoding'
-              ) {
-                continue;
-              }
-              h2Headers[lower] = String(v);
-            }
-
-            if (
-              bodyBuf &&
-              bodyBuf.length > 0 &&
-              upperM !== 'GET' &&
-              upperM !== 'HEAD'
-            ) {
-              h2Headers['content-length'] = String(bodyBuf.length);
-            }
-
-            h2Req = client.request(h2Headers);
-            let respHeaders = {};
-            const chunks = [];
-
-            h2Req.on('response', h => {
-              respHeaders = h;
-            });
-            h2Req.on('data', chunk => {
-              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-            });
-            h2Req.on('end', () => {
-              if (!resolved) {
-                resolved = true;
-                clearTimeout(timer);
-                client?.close();
-                const statusCode = Number(respHeaders[':status'] || 200);
+              for (const [k, v] of Object.entries(reqHeaders)) {
+                const lower = k.toLowerCase();
                 if (
-                  redirectMode !== 'manual' &&
-                  statusCode >= 300 &&
-                  statusCode < 400 &&
-                  respHeaders['location'] &&
-                  redirectsLeft > 0
+                  lower === 'host' ||
+                  lower === 'connection' ||
+                  lower === 'keep-alive' ||
+                  lower === 'transfer-encoding' ||
+                  lower === 'upgrade' ||
+                  lower === 'http2-settings' ||
+                  lower === 'accept-encoding'
                 ) {
-                  const nextUrl = new URL(
-                    String(respHeaders['location']),
-                    targetUrl,
-                  ).toString();
-                  const nextMethod =
-                    statusCode === 307 || statusCode === 308 ? upperM : 'GET';
-                  const nextBody =
-                    statusCode === 307 || statusCode === 308
-                      ? bodyBuf
-                      : undefined;
-                  return resolve(
-                    fetchProxyViaHttp2(
-                      nextUrl,
-                      nextMethod,
-                      reqHeaders,
-                      nextBody,
-                      redirectMode,
-                      redirectsLeft - 1,
-                      overrideIp,
-                    ),
-                  );
+                  continue;
                 }
-
-                const cleanHeaders = {};
-                for (const [hk, hv] of Object.entries(respHeaders)) {
-                  if (hk.startsWith(':') || hv === undefined) continue;
-                  cleanHeaders[hk.toLowerCase()] = hv;
-                }
-
-                resolve({
-                  status: statusCode,
-                  statusText: '',
-                  headers: cleanHeaders,
-                  data: Buffer.concat(chunks),
-                  finalUrl: targetUrl,
-                });
+                h2Headers[lower] = String(v);
               }
-            });
-            h2Req.on('error', err => {
+
+              if (
+                bodyBuf &&
+                bodyBuf.length > 0 &&
+                upperM !== 'GET' &&
+                upperM !== 'HEAD'
+              ) {
+                h2Headers['content-length'] = String(bodyBuf.length);
+              }
+
+              h2Req = client.request(h2Headers);
+              let respHeaders = {};
+              const chunks = [];
+
+              h2Req.on('response', h => {
+                respHeaders = h;
+              });
+              h2Req.on('data', chunk => {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              });
+              h2Req.on('end', () => {
+                if (!resolved) {
+                  resolved = true;
+                  clearTimeout(timer);
+                  client?.close();
+                  const statusCode = Number(respHeaders[':status'] || 200);
+                  if (
+                    redirectMode !== 'manual' &&
+                    statusCode >= 300 &&
+                    statusCode < 400 &&
+                    respHeaders['location'] &&
+                    redirectsLeft > 0
+                  ) {
+                    const nextUrl = new URL(
+                      String(respHeaders['location']),
+                      targetUrl,
+                    ).toString();
+                    const nextMethod =
+                      statusCode === 307 || statusCode === 308 ? upperM : 'GET';
+                    const nextBody =
+                      statusCode === 307 || statusCode === 308
+                        ? bodyBuf
+                        : undefined;
+                    const mergedHeaders = {...reqHeaders};
+                    if (respHeaders['set-cookie']) {
+                      const cookieKey =
+                        Object.keys(mergedHeaders).find(
+                          k => k.toLowerCase() === 'cookie',
+                        ) || 'Cookie';
+                      mergedHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                        mergedHeaders[cookieKey],
+                        respHeaders['set-cookie'],
+                      );
+                    }
+                    return resolve(
+                      fetchProxyViaHttp2(
+                        nextUrl,
+                        nextMethod,
+                        mergedHeaders,
+                        nextBody,
+                        redirectMode,
+                        redirectsLeft - 1,
+                        overrideIp,
+                        proxyUrl,
+                      ),
+                    );
+                  }
+
+                  const cleanHeaders = {};
+                  for (const [hk, hv] of Object.entries(respHeaders)) {
+                    if (hk.startsWith(':') || hv === undefined) continue;
+                    cleanHeaders[hk.toLowerCase()] = hv;
+                  }
+
+                  resolve({
+                    status: statusCode,
+                    statusText: '',
+                    headers: cleanHeaders,
+                    data: Buffer.concat(chunks),
+                    finalUrl: targetUrl,
+                  });
+                }
+              });
+              h2Req.on('error', err => {
+                if (!resolved) {
+                  resolved = true;
+                  clearTimeout(timer);
+                  client?.close();
+                  reject(err);
+                }
+              });
+
+              if (
+                bodyBuf &&
+                bodyBuf.length > 0 &&
+                upperM !== 'GET' &&
+                upperM !== 'HEAD'
+              ) {
+                h2Req.write(bodyBuf);
+              }
+              h2Req.end();
+            } catch (err) {
               if (!resolved) {
                 resolved = true;
                 clearTimeout(timer);
                 client?.close();
                 reject(err);
               }
-            });
+            }
+          })();
+        });
 
-            if (
-              bodyBuf &&
-              bodyBuf.length > 0 &&
-              upperM !== 'GET' &&
-              upperM !== 'HEAD'
-            ) {
-              h2Req.write(bodyBuf);
+      const fetchProxyViaHttp1 = async (overrideIp = '', proxyUrl = '') => {
+        let currentUrl = url;
+        let currentMethod = String(method).toUpperCase();
+        let currentBody = bodyBuffer;
+        let currentHeaders = {...outgoingHeaders};
+        const maxHops = redirect === 'manual' ? 0 : 8;
+
+        for (let hop = 0; hop <= maxHops; hop++) {
+          const parsed = new URL(currentUrl);
+          const agent = proxyUrl
+            ? getSocksAgent(proxyUrl)
+            : createIpScopedHttpsAgent(parsed.hostname, overrideIp);
+          const resHop = await axios.request({
+            url: currentUrl,
+            method: currentMethod,
+            headers: currentHeaders,
+            data: currentBody,
+            responseType: 'arraybuffer',
+            maxRedirects: 0,
+            validateStatus: () => true,
+            timeout: UPSTREAM_TIMEOUT_MS,
+            httpAgent: proxyUrl ? agent : undefined,
+            httpsAgent: agent,
+          });
+
+          if (
+            redirect !== 'manual' &&
+            resHop.status >= 300 &&
+            resHop.status < 400 &&
+            resHop.headers?.location &&
+            hop < maxHops
+          ) {
+            if (resHop.headers['set-cookie']) {
+              const cookieKey =
+                Object.keys(currentHeaders).find(
+                  k => k.toLowerCase() === 'cookie',
+                ) || 'Cookie';
+              currentHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                currentHeaders[cookieKey],
+                resHop.headers['set-cookie'],
+              );
             }
-            h2Req.end();
-          } catch (err) {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timer);
-              client?.close();
-              reject(err);
+            currentUrl = new URL(
+              String(resHop.headers.location),
+              currentUrl,
+            ).toString();
+            if (resHop.status !== 307 && resHop.status !== 308) {
+              currentMethod = 'GET';
+              currentBody = undefined;
             }
+            continue;
           }
-        });
 
-      const fetchProxyViaHttp1 = async (overrideIp = '') => {
-        const parsed = new URL(url);
-        return axios.request({
-          url,
-          method: String(method).toUpperCase(),
-          headers: outgoingHeaders,
-          data: bodyBuffer,
-          responseType: 'arraybuffer',
-          maxRedirects: redirect === 'manual' ? 0 : 8,
-          validateStatus: () => true,
-          timeout: UPSTREAM_TIMEOUT_MS,
-          httpsAgent: createIpScopedHttpsAgent(parsed.hostname, overrideIp),
-        });
+          resHop.finalUrl = currentUrl;
+          return resHop;
+        }
       };
 
       const parsedProxyUrl = new URL(url);
       const targetHostLower = parsedProxyUrl.hostname.toLowerCase();
-      const cachedIpEntry = workingEdgeIpCache.get(targetHostLower);
-      const cachedIp =
-        cachedIpEntry && Date.now() - cachedIpEntry.at < EDGE_CACHE_TTL_MS
-          ? cachedIpEntry.ip
-          : '';
+      const cachedTransport = workingTransportCache.get(targetHostLower);
+      const activeCached =
+        cachedTransport && Date.now() - cachedTransport.at < EDGE_CACHE_TTL_MS
+          ? cachedTransport
+          : null;
       const isKnownH2Host = isKnownH2OrCdnHost(url);
 
       let response;
-      if (cachedIp) {
+      if (activeCached) {
         try {
+          const cIp = activeCached.kind === 'ip' ? activeCached.value : '';
+          const cProxy = activeCached.kind === 'proxy' ? activeCached.value : '';
           response = isKnownH2Host
             ? await fetchProxyViaHttp2(
                 url,
@@ -783,9 +1169,10 @@ function startBackend() {
                 bodyBuffer,
                 redirect,
                 8,
-                cachedIp,
+                cIp,
+                cProxy,
               )
-            : await fetchProxyViaHttp1(cachedIp);
+            : await fetchProxyViaHttp1(cIp, cProxy);
         } catch {
           response = undefined;
         }
@@ -796,7 +1183,7 @@ function startBackend() {
           response.status === 403 ||
           response.status === 429
         ) {
-          workingEdgeIpCache.delete(targetHostLower);
+          workingTransportCache.delete(targetHostLower);
           response = undefined;
         }
       }
@@ -843,7 +1230,7 @@ function startBackend() {
               response = h2Fallback;
             }
           } catch {
-            // Continue to alternate edge IP lookup
+            // Continue to alternate edge IP / tunnel lookup
           }
         }
       }
@@ -855,7 +1242,7 @@ function startBackend() {
         (isKnownH2Host && (response.status === 403 || response.status === 429))
       ) {
         const altIps = await resolveAlternateEdgeIps(parsedProxyUrl.hostname);
-        for (const ip of altIps.slice(0, 6)) {
+        for (const ip of altIps.slice(0, 10)) {
           let candidate;
           try {
             candidate = await fetchProxyViaHttp1(ip);
@@ -885,7 +1272,56 @@ function startBackend() {
             }
           }
           if (candidate && candidate.status >= 200 && candidate.status < 400) {
-            workingEdgeIpCache.set(targetHostLower, {at: Date.now(), ip});
+            workingTransportCache.set(targetHostLower, {
+              kind: 'ip',
+              value: ip,
+              at: Date.now(),
+            });
+            response = candidate;
+            break;
+          }
+        }
+      }
+
+      if (
+        !response ||
+        response.status === 426 ||
+        response.status === 428 ||
+        (isKnownH2Host && (response.status === 403 || response.status === 429))
+      ) {
+        const tunnels = await getAvailableProxyTunnels();
+        for (const proxyUrl of tunnels) {
+          let candidate;
+          try {
+            candidate = await fetchProxyViaHttp1('', proxyUrl);
+          } catch {
+            candidate = undefined;
+          }
+          if (!candidate || candidate.status >= 400) {
+            try {
+              const h2Candidate = await fetchProxyViaHttp2(
+                url,
+                method,
+                outgoingHeaders,
+                bodyBuffer,
+                redirect,
+                8,
+                '',
+                proxyUrl,
+              );
+              if (h2Candidate.status < 400) {
+                candidate = h2Candidate;
+              }
+            } catch {
+              // Ignore
+            }
+          }
+          if (candidate && candidate.status >= 200 && candidate.status < 400) {
+            workingTransportCache.set(targetHostLower, {
+              kind: 'proxy',
+              value: proxyUrl,
+              at: Date.now(),
+            });
             response = candidate;
             break;
           }
@@ -1272,12 +1708,49 @@ function startBackend() {
     });
   });
 
+  async function createStreamH2Session(targetUrl, overrideIp = '', proxyUrl = '') {
+    const parsed = new URL(targetUrl);
+    if (proxyUrl) {
+      const proxy = parseSocks5Url(proxyUrl);
+      const {socket} = await SocksClient.createConnection({
+        proxy,
+        command: 'connect',
+        destination: {
+          host: parsed.hostname,
+          port: Number(parsed.port || (parsed.protocol === 'http:' ? 80 : 443)),
+        },
+        timeout: 15000,
+      });
+      if (parsed.protocol === 'http:') {
+        return http2.connect(parsed.origin, {
+          createConnection: () => socket,
+        });
+      }
+      const tlsSock = tls.connect({
+        socket,
+        servername: parsed.hostname,
+        ALPNProtocols: ['h2', 'http/1.1'],
+        rejectUnauthorized: false,
+      });
+      return http2.connect(parsed.origin, {
+        createConnection: () => tlsSock,
+      });
+    }
+    return http2.connect(parsed.origin, {
+      rejectUnauthorized: false,
+      ...(overrideIp
+        ? {lookup: createHostScopedLookup(parsed.hostname, overrideIp)}
+        : {}),
+    });
+  }
+
   function openHttp2Stream(
     targetUrl,
     outgoingHeaders,
     method = 'GET',
     redirectsLeft = 5,
     overrideIp = '',
+    proxyUrl = '',
   ) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1290,127 +1763,136 @@ function startBackend() {
           client?.close();
           reject(new Error('HTTP/2 stream timeout'));
         }
-      }, Math.min(UPSTREAM_TIMEOUT_MS, 20000));
+      }, Math.min(UPSTREAM_TIMEOUT_MS, 25000));
 
-      try {
-        const parsed = new URL(targetUrl);
-        client = http2.connect(parsed.origin, {
-          rejectUnauthorized: false,
-          ...(overrideIp
-            ? {lookup: createHostScopedLookup(parsed.hostname, overrideIp)}
-            : {}),
-        });
+      (async () => {
+        try {
+          const parsed = new URL(targetUrl);
+          client = await createStreamH2Session(targetUrl, overrideIp, proxyUrl);
 
-        client.on('error', err => {
-          if (!settled) {
+          client.on('error', err => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(err);
+            }
+          });
+
+          const h2Headers = {
+            ':method': method === 'HEAD' ? 'HEAD' : 'GET',
+            ':scheme': parsed.protocol.replace(':', ''),
+            ':authority': parsed.host,
+            ':path': parsed.pathname + parsed.search,
+          };
+
+          for (const [k, v] of Object.entries(outgoingHeaders)) {
+            const lower = k.toLowerCase();
+            if (
+              lower === 'host' ||
+              lower === 'connection' ||
+              lower === 'keep-alive' ||
+              lower === 'transfer-encoding' ||
+              lower === 'upgrade' ||
+              lower === 'http2-settings'
+            ) {
+              continue;
+            }
+            h2Headers[lower] = String(v);
+          }
+
+          h2Req = client.request(h2Headers);
+
+          h2Req.on('response', respHeaders => {
+            if (settled) return;
+            const statusCode = Number(respHeaders[':status'] || 200);
+
+            if (
+              statusCode >= 300 &&
+              statusCode < 400 &&
+              respHeaders['location'] &&
+              redirectsLeft > 0
+            ) {
+              settled = true;
+              clearTimeout(timer);
+              h2Req.destroy();
+              client.close();
+              const redirectUrl = new URL(
+                String(respHeaders['location']),
+                targetUrl,
+              ).toString();
+              const mergedHeaders = {...outgoingHeaders};
+              if (respHeaders['set-cookie']) {
+                const cookieKey =
+                  Object.keys(mergedHeaders).find(
+                    k => k.toLowerCase() === 'cookie',
+                  ) || 'Cookie';
+                mergedHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                  mergedHeaders[cookieKey],
+                  respHeaders['set-cookie'],
+                );
+              }
+              openHttp2Stream(
+                redirectUrl,
+                mergedHeaders,
+                method,
+                redirectsLeft - 1,
+                overrideIp,
+                proxyUrl,
+              )
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
+
             settled = true;
             clearTimeout(timer);
-            reject(err);
-          }
-        });
 
-        const h2Headers = {
-          ':method': method === 'HEAD' ? 'HEAD' : 'GET',
-          ':scheme': parsed.protocol.replace(':', ''),
-          ':authority': parsed.host,
-          ':path': parsed.pathname + parsed.search,
-        };
+            const normalizedHeaders = {};
+            for (const [hk, hv] of Object.entries(respHeaders)) {
+              if (hk.startsWith(':') || hv === undefined) continue;
+              normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
+                ? hv.join(', ')
+                : String(hv);
+            }
 
-        for (const [k, v] of Object.entries(outgoingHeaders)) {
-          const lower = k.toLowerCase();
-          if (
-            lower === 'host' ||
-            lower === 'connection' ||
-            lower === 'keep-alive' ||
-            lower === 'transfer-encoding' ||
-            lower === 'upgrade' ||
-            lower === 'http2-settings'
-          ) {
-            continue;
-          }
-          h2Headers[lower] = String(v);
-        }
+            resolve({
+              protocol: 'h2',
+              status: statusCode,
+              headers: normalizedHeaders,
+              finalUrl: targetUrl,
+              stream: h2Req,
+              destroy: () => {
+                try {
+                  h2Req.destroy();
+                } catch {}
+                try {
+                  client.close();
+                } catch {}
+              },
+            });
+          });
 
-        h2Req = client.request(h2Headers);
-
-        h2Req.on('response', respHeaders => {
-          if (settled) return;
-          const statusCode = Number(respHeaders[':status'] || 200);
-
-          if (
-            statusCode >= 300 &&
-            statusCode < 400 &&
-            respHeaders['location'] &&
-            redirectsLeft > 0
-          ) {
-            settled = true;
-            clearTimeout(timer);
-            h2Req.destroy();
-            client.close();
-            const redirectUrl = new URL(
-              String(respHeaders['location']),
-              targetUrl,
-            ).toString();
-            openHttp2Stream(
-              redirectUrl,
-              outgoingHeaders,
-              method,
-              redirectsLeft - 1,
-              overrideIp,
-            )
-              .then(resolve)
-              .catch(reject);
-            return;
-          }
-
-          settled = true;
-          clearTimeout(timer);
-
-          const normalizedHeaders = {};
-          for (const [hk, hv] of Object.entries(respHeaders)) {
-            if (hk.startsWith(':') || hv === undefined) continue;
-            normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
-              ? hv.join(', ')
-              : String(hv);
-          }
-
-          resolve({
-            protocol: 'h2',
-            status: statusCode,
-            headers: normalizedHeaders,
-            finalUrl: targetUrl,
-            stream: h2Req,
-            destroy: () => {
-              try {
-                h2Req.destroy();
-              } catch {}
+          h2Req.on('error', err => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
               try {
                 client.close();
               } catch {}
-            },
+              reject(err);
+            }
           });
-        });
-
-        h2Req.on('error', err => {
+        } catch (err) {
           if (!settled) {
             settled = true;
             clearTimeout(timer);
             try {
-              client.close();
+              client?.close();
             } catch {}
             reject(err);
           }
-        });
-      } catch (err) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          try {
-            client?.close();
-          } catch {}
-          reject(err);
         }
-      }
+      })();
     });
   }
 
@@ -1419,44 +1901,79 @@ function startBackend() {
     outgoingHeaders,
     method = 'GET',
     overrideIp = '',
+    proxyUrl = '',
   ) {
-    const parsed = new URL(targetUrl);
-    const upstream = await axios.request({
-      url: targetUrl,
-      method: method === 'HEAD' ? 'HEAD' : 'GET',
-      headers: outgoingHeaders,
-      responseType: 'stream',
-      maxRedirects: 8,
-      validateStatus: () => true,
-      timeout: UPSTREAM_TIMEOUT_MS,
-      httpsAgent: createIpScopedHttpsAgent(parsed.hostname, overrideIp),
-    });
+    let currentUrl = targetUrl;
+    let currentHeaders = {...outgoingHeaders};
+    const maxHops = 8;
 
-    const normalizedHeaders = {};
-    for (const [hk, hv] of Object.entries(upstream.headers || {})) {
-      if (hv === undefined) continue;
-      normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
-        ? hv.join(', ')
-        : String(hv);
-    }
+    for (let hop = 0; hop <= maxHops; hop++) {
+      const parsed = new URL(currentUrl);
+      const agent = proxyUrl
+        ? getSocksAgent(proxyUrl)
+        : createIpScopedHttpsAgent(parsed.hostname, overrideIp);
+      const upstream = await axios.request({
+        url: currentUrl,
+        method: method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: currentHeaders,
+        responseType: 'stream',
+        maxRedirects: 0,
+        validateStatus: () => true,
+        timeout: UPSTREAM_TIMEOUT_MS,
+        httpAgent: proxyUrl ? agent : undefined,
+        httpsAgent: agent,
+      });
 
-    const finalUrl =
-      upstream.request?.res?.responseUrl || upstream.config?.url || targetUrl;
-
-    return {
-      protocol: 'h1',
-      status: upstream.status,
-      headers: normalizedHeaders,
-      finalUrl,
-      stream: upstream.data,
-      destroy: () => {
+      if (
+        upstream.status >= 300 &&
+        upstream.status < 400 &&
+        upstream.headers?.location &&
+        hop < maxHops
+      ) {
         try {
-          if (upstream.data && typeof upstream.data.destroy === 'function') {
-            upstream.data.destroy();
-          }
+          upstream.data?.destroy();
         } catch {}
-      },
-    };
+        if (upstream.headers['set-cookie']) {
+          const cookieKey =
+            Object.keys(currentHeaders).find(
+              k => k.toLowerCase() === 'cookie',
+            ) || 'Cookie';
+          currentHeaders[cookieKey] = mergeCookiesFromSetCookie(
+            currentHeaders[cookieKey],
+            upstream.headers['set-cookie'],
+          );
+        }
+        currentUrl = new URL(
+          String(upstream.headers.location),
+          currentUrl,
+        ).toString();
+        continue;
+      }
+
+      const normalizedHeaders = {};
+      for (const [hk, hv] of Object.entries(upstream.headers || {})) {
+        if (hv === undefined) continue;
+        normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
+          ? hv.join(', ')
+          : String(hv);
+      }
+
+      return {
+        protocol: 'h1',
+        status: upstream.status,
+        headers: normalizedHeaders,
+        finalUrl: currentUrl,
+        stream: upstream.data,
+        destroy: () => {
+          try {
+            if (upstream.data && typeof upstream.data.destroy === 'function') {
+              upstream.data.destroy();
+            }
+          } catch {}
+        },
+      };
+    }
+    throw new Error('Too many redirects');
   }
 
   function isRetryableStreamStatus(status, isH2Cdn) {
@@ -1469,14 +1986,14 @@ function startBackend() {
     const parsed = new URL(targetUrl);
     const hostLower = parsed.hostname.toLowerCase();
     const isH2Cdn = isKnownH2OrCdnHost(targetUrl);
-    const cachedIpEntry = workingEdgeIpCache.get(hostLower);
-    const cachedIp =
-      cachedIpEntry && Date.now() - cachedIpEntry.at < EDGE_CACHE_TTL_MS
-        ? cachedIpEntry.ip
-        : '';
+    const cachedTransport = workingTransportCache.get(hostLower);
+    const activeCached =
+      cachedTransport && Date.now() - cachedTransport.at < EDGE_CACHE_TTL_MS
+        ? cachedTransport
+        : null;
 
     let lastResult = null;
-    const tryCandidate = async (proto, overrideIp) => {
+    const tryCandidate = async (proto, overrideIp, proxyUrl = '') => {
       try {
         const resObj =
           proto === 'h2'
@@ -1486,18 +2003,27 @@ function startBackend() {
                 method,
                 5,
                 overrideIp,
+                proxyUrl,
               )
             : await openHttp1Stream(
                 targetUrl,
                 outgoingHeaders,
                 method,
                 overrideIp,
+                proxyUrl,
               );
         if (resObj.status >= 200 && resObj.status < 400) {
-          if (overrideIp) {
-            workingEdgeIpCache.set(hostLower, {
+          if (proxyUrl) {
+            workingTransportCache.set(hostLower, {
+              kind: 'proxy',
+              value: proxyUrl,
               at: Date.now(),
-              ip: overrideIp,
+            });
+          } else if (overrideIp) {
+            workingTransportCache.set(hostLower, {
+              kind: 'ip',
+              value: overrideIp,
+              at: Date.now(),
             });
           }
           return resObj;
@@ -1510,16 +2036,18 @@ function startBackend() {
       }
     };
 
-    // 1. Fast path: previously verified edge PoP IP for this CDN host
-    if (cachedIp) {
+    // 1. Fast path: previously verified edge PoP IP or SOCKS5 tunnel for this host
+    if (activeCached) {
+      const cIp = activeCached.kind === 'ip' ? activeCached.value : '';
+      const cProxy = activeCached.kind === 'proxy' ? activeCached.value : '';
       const hit =
-        (await tryCandidate(isH2Cdn ? 'h1' : 'h1', cachedIp)) ||
-        (await tryCandidate('h2', cachedIp));
+        (await tryCandidate('h1', cIp, cProxy)) ||
+        (await tryCandidate('h2', cIp, cProxy));
       if (hit) return hit;
-      workingEdgeIpCache.delete(hostLower);
+      workingTransportCache.delete(hostLower);
     }
 
-    // 2. Standard default resolution (H2 + H1 cascade)
+    // 2. Standard direct H2 + H1 cascade
     if (isH2Cdn) {
       const h2Hit = await tryCandidate('h2', '');
       if (h2Hit) return h2Hit;
@@ -1538,14 +2066,25 @@ function startBackend() {
       }
     }
 
-    // 3. Regional DoH GeoDNS PoP bypass when default edge returns 426/428/403/429
+    // 3. Round-robin DoH GeoDNS PoP cascade when direct edge returns 426/428/403/429
     if (!lastResult || isRetryableStreamStatus(lastResult.status, isH2Cdn)) {
       const altIps = await resolveAlternateEdgeIps(parsed.hostname);
-      for (const ip of altIps.slice(0, 6)) {
+      for (const ip of altIps.slice(0, 10)) {
         const h1Alt = await tryCandidate('h1', ip);
         if (h1Alt) return h1Alt;
         const h2Alt = await tryCandidate('h2', ip);
         if (h2Alt) return h2Alt;
+      }
+    }
+
+    // 4. Outbound userspace WARP / non-US Tor SOCKS5 tunnel fallback when host/ASN rejects server IP
+    if (!lastResult || isRetryableStreamStatus(lastResult.status, isH2Cdn)) {
+      const tunnels = await getAvailableProxyTunnels();
+      for (const proxyUrl of tunnels) {
+        const h1Tunnel = await tryCandidate('h1', '', proxyUrl);
+        if (h1Tunnel) return h1Tunnel;
+        const h2Tunnel = await tryCandidate('h2', '', proxyUrl);
+        if (h2Tunnel) return h2Tunnel;
       }
     }
 
@@ -1753,8 +2292,13 @@ function startBackend() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `Vega Web standalone backend running on http://0.0.0.0:${PORT} (ffmpeg=${FFMPEG_AVAILABLE}, ffprobe=${FFPROBE_AVAILABLE})`,
+      `Vega Web standalone backend running on http://0.0.0.0:${PORT} (ffmpeg=${FFMPEG_AVAILABLE}, ffprobe=${FFPROBE_AVAILABLE}, warp=${WIREPROXY_AVAILABLE}, tor=${TOR_AVAILABLE})`,
     );
+    // Warm fallback tunnels in background without blocking HTTP readiness or /api/health
+    setTimeout(() => {
+      if (WIREPROXY_AVAILABLE) ensureWarpTunnel().catch(() => {});
+      if (TOR_AVAILABLE) ensureTorTunnel().catch(() => {});
+    }, 500);
   });
 }
 

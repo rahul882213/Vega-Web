@@ -2,6 +2,7 @@ services:
   - type: web
     name: vega-web-backend
     runtime: docker
+    region: singapore
     rootDir: backend
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health

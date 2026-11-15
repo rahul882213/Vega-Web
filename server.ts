@@ -9,6 +9,7 @@ import axios from 'axios';
 import https from 'https';
 import http2 from 'http2';
 import dns from 'dns';
+import {SocksProxyAgent} from 'socks-proxy-agent';
 
 const SERVER_PORT = Number(process.env.PORT || 3000);
 const execFileAsync = promisify(execFile);
@@ -272,6 +273,52 @@ function isKnownH2OrCdnHost(targetUrl: string): boolean {
 const workingEdgeIpCache = new Map<string, {at: number; ip: string}>();
 const alternateEdgeIpsCache = new Map<string, {at: number; ips: string[]}>();
 const EDGE_CACHE_TTL_MS = 10 * 60 * 1000;
+const ENV_STREAM_PROXY_URL = String(process.env.STREAM_PROXY_URL || '').trim();
+const socksAgentCache = new Map<string, SocksProxyAgent>();
+
+function getSocksAgent(proxyUrl: string): SocksProxyAgent {
+  let agent = socksAgentCache.get(proxyUrl);
+  if (!agent) {
+    agent = new SocksProxyAgent(proxyUrl, {
+      keepAlive: true,
+    });
+    socksAgentCache.set(proxyUrl, agent);
+  }
+  return agent;
+}
+
+function mergeCookiesFromSetCookie(
+  existingCookie: string | undefined,
+  setCookieHeader: string | string[] | undefined,
+): string {
+  const jar = new Map<string, string>();
+  const addCookieString = (str: string) => {
+    for (const part of String(str || '').split(';')) {
+      const eq = part.indexOf('=');
+      if (eq > 0) {
+        const k = part.slice(0, eq).trim();
+        const v = part.slice(eq + 1).trim();
+        if (k) jar.set(k, v);
+      }
+    }
+  };
+  if (existingCookie) addCookieString(existingCookie);
+  const rawList = Array.isArray(setCookieHeader)
+    ? setCookieHeader
+    : setCookieHeader
+      ? [String(setCookieHeader)]
+      : [];
+  for (const sc of rawList) {
+    const firstPart = String(sc).split(';')[0];
+    const eq = firstPart.indexOf('=');
+    if (eq > 0) {
+      jar.set(firstPart.slice(0, eq).trim(), firstPart.slice(eq + 1).trim());
+    }
+  }
+  return Array.from(jar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
 
 function createHostScopedLookup(targetHost: string, overrideIp: string) {
   return (hostname: string, options: any, callback: any) => {
@@ -314,15 +361,10 @@ async function resolveAlternateEdgeIps(hostname: string): Promise<string[]> {
     '103.21.244.0/24',
     '49.36.0.0/16',
     '185.220.100.0/24',
+    '200.160.0.0/16',
   ];
 
   const results = await Promise.allSettled([
-    ...ecsSubnets.map(subnet =>
-      axios.get(
-        `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A&edns_client_subnet=${encodeURIComponent(subnet)}`,
-        {timeout: 3500, validateStatus: () => true},
-      ),
-    ),
     axios.get(
       `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
       {
@@ -331,22 +373,45 @@ async function resolveAlternateEdgeIps(hostname: string): Promise<string[]> {
         validateStatus: () => true,
       },
     ),
+    axios.get(
+      `https://dns.alidns.com/resolve?name=${encodeURIComponent(host)}&type=1`,
+      {timeout: 3500, validateStatus: () => true},
+    ),
+    ...ecsSubnets.map(subnet =>
+      axios.get(
+        `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A&edns_client_subnet=${encodeURIComponent(subnet)}`,
+        {timeout: 3500, validateStatus: () => true},
+      ),
+    ),
   ]);
 
-  const seen = new Set<string>();
-  const ips: string[] = [];
+  const buckets: string[][] = [];
   for (const r of results) {
     if (r.status !== 'fulfilled') continue;
     const answers = Array.isArray(r.value?.data?.Answer)
       ? r.value.data.Answer
       : [];
+    const list: string[] = [];
     for (const ans of answers) {
       if (ans?.type === 1 && typeof ans.data === 'string') {
         const ip = ans.data.trim();
-        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && !seen.has(ip)) {
-          seen.add(ip);
-          ips.push(ip);
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+          list.push(ip);
         }
+      }
+    }
+    if (list.length > 0) buckets.push(list);
+  }
+
+  const seen = new Set<string>();
+  const ips: string[] = [];
+  const maxLen = Math.max(0, ...buckets.map(b => b.length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const bucket of buckets) {
+      const ip = bucket[i];
+      if (ip && !seen.has(ip)) {
+        seen.add(ip);
+        ips.push(ip);
       }
     }
   }
@@ -1376,44 +1441,79 @@ async function startServer() {
     outgoingHeaders: Record<string, string>,
     method = 'GET',
     overrideIp = '',
+    proxyUrl = '',
   ) {
-    const parsed = new URL(targetUrl);
-    const upstream = await axios.request({
-      url: targetUrl,
-      method: method === 'HEAD' ? 'HEAD' : 'GET',
-      headers: outgoingHeaders,
-      responseType: 'stream',
-      maxRedirects: 8,
-      validateStatus: () => true,
-      timeout: 30000,
-      httpsAgent: createIpScopedHttpsAgent(parsed.hostname, overrideIp),
-    });
+    let currentUrl = targetUrl;
+    const currentHeaders: Record<string, string> = {...outgoingHeaders};
+    const maxHops = 8;
 
-    const normalizedHeaders: Record<string, string> = {};
-    for (const [hk, hv] of Object.entries(upstream.headers || {})) {
-      if (hv === undefined) continue;
-      normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
-        ? hv.join(', ')
-        : String(hv);
-    }
+    for (let hop = 0; hop <= maxHops; hop++) {
+      const parsed = new URL(currentUrl);
+      const agent = proxyUrl
+        ? getSocksAgent(proxyUrl)
+        : createIpScopedHttpsAgent(parsed.hostname, overrideIp);
+      const upstream = await axios.request({
+        url: currentUrl,
+        method: method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: currentHeaders,
+        responseType: 'stream',
+        maxRedirects: 0,
+        validateStatus: () => true,
+        timeout: 30000,
+        httpAgent: proxyUrl ? agent : undefined,
+        httpsAgent: agent,
+      });
 
-    const finalUrl =
-      upstream.request?.res?.responseUrl || upstream.config?.url || targetUrl;
-
-    return {
-      protocol: 'h1',
-      status: upstream.status,
-      headers: normalizedHeaders,
-      finalUrl,
-      stream: upstream.data,
-      destroy: () => {
+      if (
+        upstream.status >= 300 &&
+        upstream.status < 400 &&
+        upstream.headers?.location &&
+        hop < maxHops
+      ) {
         try {
-          if (upstream.data && typeof upstream.data.destroy === 'function') {
-            upstream.data.destroy();
-          }
+          upstream.data?.destroy();
         } catch {}
-      },
-    };
+        if (upstream.headers['set-cookie']) {
+          const cookieKey =
+            Object.keys(currentHeaders).find(
+              k => k.toLowerCase() === 'cookie',
+            ) || 'Cookie';
+          currentHeaders[cookieKey] = mergeCookiesFromSetCookie(
+            currentHeaders[cookieKey],
+            upstream.headers['set-cookie'],
+          );
+        }
+        currentUrl = new URL(
+          String(upstream.headers.location),
+          currentUrl,
+        ).toString();
+        continue;
+      }
+
+      const normalizedHeaders: Record<string, string> = {};
+      for (const [hk, hv] of Object.entries(upstream.headers || {})) {
+        if (hv === undefined) continue;
+        normalizedHeaders[hk.toLowerCase()] = Array.isArray(hv)
+          ? hv.join(', ')
+          : String(hv);
+      }
+
+      return {
+        protocol: 'h1',
+        status: upstream.status,
+        headers: normalizedHeaders,
+        finalUrl: currentUrl,
+        stream: upstream.data,
+        destroy: () => {
+          try {
+            if (upstream.data && typeof upstream.data.destroy === 'function') {
+              upstream.data.destroy();
+            }
+          } catch {}
+        },
+      };
+    }
+    throw new Error('Too many redirects');
   }
 
   function isRetryableStreamStatus(status: number, isH2Cdn: boolean): boolean {
@@ -1481,11 +1581,33 @@ async function startServer() {
 
     if (!lastResult || isRetryableStreamStatus(lastResult.status, isH2Cdn)) {
       const altIps = await resolveAlternateEdgeIps(parsed.hostname);
-      for (const ip of altIps.slice(0, 6)) {
+      for (const ip of altIps.slice(0, 10)) {
         const h1Alt = await tryCandidate('h1', ip);
         if (h1Alt) return h1Alt;
         const h2Alt = await tryCandidate('h2', ip);
         if (h2Alt) return h2Alt;
+      }
+    }
+
+    if (
+      ENV_STREAM_PROXY_URL &&
+      (!lastResult || isRetryableStreamStatus(lastResult.status, isH2Cdn))
+    ) {
+      try {
+        const resObj = await openHttp1Stream(
+          targetUrl,
+          outgoingHeaders,
+          method,
+          '',
+          ENV_STREAM_PROXY_URL,
+        );
+        if (resObj.status >= 200 && resObj.status < 400) {
+          return resObj;
+        }
+        if (lastResult) lastResult.destroy();
+        lastResult = resObj;
+      } catch {
+        // Ignore optional proxy failure
       }
     }
 

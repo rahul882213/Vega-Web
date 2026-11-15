@@ -36,7 +36,9 @@ npm start
 ### Option 1: Render (Docker — includes FFmpeg/FFprobe)
 1. Push your repository to GitHub (`main` branch).
 2. In Render Dashboard, choose **New + -> Web Service** and connect `rahul882213/Vega-Web`.
-3. Set **Root Directory** to `backend`, **Runtime** to `Docker` (uses `backend/Dockerfile`), and **Health Check Path** to `/api/health`.
+3. Choose **Runtime: Docker**:
+   - Either set **Dockerfile Path** to `backend/Dockerfile` (default repository root `.` context), **OR** set **Root Directory** to `backend` with **Dockerfile Path** `Dockerfile`.
+   - Set **Health Check Path** to `/api/health`.
 4. Add environment variables:
    - `NODE_ENV=production`
    - `ALLOWED_ORIGINS=https://rahul882213.github.io`

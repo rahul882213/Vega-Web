@@ -421,16 +421,33 @@ async function ensureWarpTunnel() {
 let torTunnelPromise = null;
 let torTunnelUrl = '';
 let torTunnelDisabledUntil = 0;
+let torChild = null;
+let torStatusNote = 'not-started';
+
+async function checkTorReady() {
+  if (!(await isPortAccepting('127.0.0.1', 19050))) {
+    return false;
+  }
+  try {
+    const log = fs.readFileSync('/tmp/vega-tor/tor.log', 'utf8');
+    if (log.includes('Bootstrapped 100%')) {
+      torTunnelUrl = 'socks5h://127.0.0.1:19050';
+      torStatusNote = 'ready';
+      return true;
+    }
+  } catch {}
+  return false;
+}
 
 async function ensureTorTunnel() {
-  if (!TOR_AVAILABLE) return '';
-  if (torTunnelUrl && (await isPortAccepting('127.0.0.1', 19050))) {
-    try {
-      const log = fs.readFileSync('/tmp/vega-tor/tor.log', 'utf8');
-      if (log.includes('Bootstrapped 100%')) return torTunnelUrl;
-    } catch {}
+  if (!TOR_AVAILABLE) {
+    torStatusNote = 'tor-binary-missing';
+    return '';
   }
-  if (Date.now() < torTunnelDisabledUntil) return '';
+  if (await checkTorReady()) {
+    return torTunnelUrl;
+  }
+  if (Date.now() < torTunnelDisabledUntil && !torChild) return '';
   if (torTunnelPromise) return torTunnelPromise;
 
   torTunnelPromise = (async () => {
@@ -439,48 +456,69 @@ async function ensureTorTunnel() {
       fs.mkdirSync(torDir, {recursive: true, mode: 0o700});
       const logPath = `${torDir}/tor.log`;
       const torrcPath = `${torDir}/torrc`;
-      const torrc = [
-        'SocksPort 19050',
-        'ControlPort 19051',
-        'CookieAuthentication 0',
-        `DataDirectory ${torDir}`,
-        'ExitNodes {sg},{jp},{in},{hk},{tw},{nl},{de},{fr},{gb}',
-        'StrictNodes 1',
-        'CircuitBuildTimeout 15',
-        'LearnCircuitBuildTimeout 0',
-        `Log notice file ${logPath}`,
-        '',
-      ].join('\n');
-      fs.writeFileSync(torrcPath, torrc, 'utf8');
-      try {
-        fs.writeFileSync(logPath, '', 'utf8');
-      } catch {}
 
-      const torProc = spawn('tor', ['-f', torrcPath], {
-        stdio: ['ignore', 'ignore', 'ignore'],
-      });
-      torProc.unref();
-      torProc.on('exit', () => {
-        torTunnelUrl = '';
-      });
+      if (!torChild) {
+        const torrc = [
+          'SocksPort 19050',
+          'ControlPort 19051',
+          'CookieAuthentication 0',
+          `DataDirectory ${torDir}`,
+          'ExcludeExitNodes {us},{??}',
+          'StrictNodes 1',
+          'CircuitBuildTimeout 15',
+          'LearnCircuitBuildTimeout 0',
+          `Log notice file ${logPath}`,
+          '',
+        ].join('\n');
+        fs.writeFileSync(torrcPath, torrc, 'utf8');
+        try {
+          fs.writeFileSync(logPath, '', 'utf8');
+        } catch {}
 
-      for (let i = 0; i < 45; i++) {
+        torStatusNote = 'starting';
+        const child = spawn('tor', ['-f', torrcPath], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        torChild = child;
+        const appendDiag = chunk => {
+          const line = String(chunk || '').trim();
+          if (line) {
+            torStatusNote = line.slice(-180);
+          }
+        };
+        child.stdout?.on('data', appendDiag);
+        child.stderr?.on('data', appendDiag);
+        child.unref();
+        child.on('exit', code => {
+          if (torChild === child) torChild = null;
+          torTunnelUrl = '';
+          torStatusNote = `exited(${code ?? 'null'})`;
+        });
+      }
+
+      for (let i = 0; i < 90; i++) {
+        if (await checkTorReady()) {
+          return torTunnelUrl;
+        }
+        if (!torChild) {
+          break;
+        }
         try {
           const log = fs.readFileSync(logPath, 'utf8');
-          if (
-            log.includes('Bootstrapped 100%') &&
-            (await isPortAccepting('127.0.0.1', 19050))
-          ) {
-            torTunnelUrl = 'socks5h://127.0.0.1:19050';
-            return torTunnelUrl;
+          const lines = log.trim().split('\n');
+          if (lines.length > 0) {
+            torStatusNote = lines[lines.length - 1].slice(-180);
           }
         } catch {}
         await new Promise(r => setTimeout(r, 500));
       }
-      torTunnelDisabledUntil = Date.now() + 60 * 1000;
+      if (!torChild) {
+        torTunnelDisabledUntil = Date.now() + 30 * 1000;
+      }
       return '';
-    } catch {
-      torTunnelDisabledUntil = Date.now() + 60 * 1000;
+    } catch (err) {
+      torStatusNote = `error:${err?.message || err}`;
+      torTunnelDisabledUntil = Date.now() + 30 * 1000;
       return '';
     } finally {
       torTunnelPromise = null;
@@ -852,7 +890,7 @@ function startBackend() {
       ok: true,
       status: 'healthy',
       service: 'vega-web-backend',
-      version: '2.2.1',
+      version: '2.2.2',
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
       ffmpegAvailable: FFMPEG_AVAILABLE,
@@ -862,6 +900,7 @@ function startBackend() {
         warpReady: Boolean(warpTunnelUrl),
         torAvailable: TOR_AVAILABLE,
         torReady: Boolean(torTunnelUrl),
+        torNote: torStatusNote,
       },
       allowedOrigins: ALLOWED_ORIGIN_LIST,
     });

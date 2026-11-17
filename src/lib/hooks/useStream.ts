@@ -42,6 +42,7 @@ function scoreStreamCandidate(item: Stream): number {
 
   let score = 0;
   if (isLikelyWebpageUrl(linkLower)) score += 100;
+  if (typeLower === 'iframe') score += 80;
   if (serverLower.includes('download only')) score += 50;
   if (
     serverLower.includes('instantcloud') ||
@@ -50,6 +51,7 @@ function scoreStreamCandidate(item: Stream): number {
   ) {
     if (
       !linkLower.includes('.mp4') &&
+      !linkLower.includes('.mkv') &&
       !linkLower.includes('.m3u8') &&
       !linkLower.includes('.mpd')
     ) {
@@ -61,9 +63,11 @@ function scoreStreamCandidate(item: Stream): number {
     typeLower === 'mpd' ||
     typeLower === 'dash' ||
     typeLower === 'mp4' ||
+    typeLower === 'mkv' ||
     linkLower.includes('.m3u8') ||
     linkLower.includes('.mpd') ||
     linkLower.includes('.mp4') ||
+    linkLower.includes('.mkv') ||
     linkLower.includes('r2.cloudflarestorage.com') ||
     linkLower.includes('workers.dev') ||
     linkLower.includes('hakunaymatata.com') ||
@@ -324,10 +328,16 @@ export const useStream = ({
       }
     }
 
-    // Prefer untried non-webpage media streams during auto-fallback
-    const nextIdx = orderedCandidates.find(
-      idx => !isLikelyWebpageUrl(streamData[idx].link),
-    );
+    // Prefer untried non-webpage, non-iframe media streams first during auto-fallback
+    const nextIdx =
+      orderedCandidates.find(
+        idx =>
+          !isLikelyWebpageUrl(streamData[idx].link) &&
+          (streamData[idx].type || '').toLowerCase() !== 'iframe',
+      ) ??
+      orderedCandidates.find(
+        idx => !isLikelyWebpageUrl(streamData[idx].link),
+      );
 
     if (nextIdx !== undefined) {
       triedIndicesRef.current.add(nextIdx);

@@ -157,7 +157,16 @@ export const ScrollList: React.FC<{routeParams: ScrollListRouteParams}> = ({
                       src={item.image}
                       alt={item.title}
                       loading="lazy"
+                      referrerPolicy="no-referrer"
                       className="w-full h-full object-cover"
+                      onError={e => {
+                        const img = e.currentTarget as HTMLImageElement;
+                        if (!img.dataset.fallbackApplied) {
+                          img.dataset.fallbackApplied = '1';
+                          img.src =
+                            'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
+                        }
+                      }}
                     />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center p-2 text-xs text-center opacity-50">
@@ -196,7 +205,16 @@ export const ScrollList: React.FC<{routeParams: ScrollListRouteParams}> = ({
                 <img
                   src={item.image}
                   alt={item.title}
+                  referrerPolicy="no-referrer"
                   className="w-16 h-24 rounded-xl object-cover shrink-0 bg-black/30"
+                  onError={e => {
+                    const img = e.currentTarget as HTMLImageElement;
+                    if (!img.dataset.fallbackApplied) {
+                      img.dataset.fallbackApplied = '1';
+                      img.src =
+                        'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
+                    }
+                  }}
                 />
                 <div className="min-w-0 flex-1">
                   <p

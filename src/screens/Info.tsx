@@ -127,13 +127,26 @@ export const Info: React.FC<{routeParams: InfoRouteParams}> = ({
             <img
               src={backgroundImage}
               alt=""
+              referrerPolicy="no-referrer"
               className="w-full h-full object-cover blur-xl scale-110 opacity-50"
+              onError={e => {
+                (e.currentTarget as HTMLImageElement).style.display = 'none';
+              }}
             />
             <div className="absolute inset-0 flex items-center justify-center pt-10 pb-6">
               <img
                 src={posterImage || backgroundImage}
                 alt={displayTitle}
+                referrerPolicy="no-referrer"
                 className="h-full max-h-[210px] w-auto rounded-2xl object-cover shadow-2xl border border-white/10"
+                onError={e => {
+                  const img = e.currentTarget as HTMLImageElement;
+                  if (!img.dataset.fallbackApplied) {
+                    img.dataset.fallbackApplied = '1';
+                    img.src =
+                      'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
+                  }
+                }}
               />
             </div>
           </>

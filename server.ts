@@ -647,6 +647,39 @@ async function startServer() {
           ? Buffer.from(bodyBase64, 'base64')
           : undefined;
 
+      const PROXY_DIRECT_TIMEOUT_MS = 8500;
+      const PROXY_ALT_TIMEOUT_MS = 5500;
+      const PROXY_TUNNEL_TIMEOUT_MS = 8500;
+      const initialUrlObj = new URL(url);
+      const initialHostLower = initialUrlObj.hostname.toLowerCase();
+
+      const isProxyChallengeOrBlocked = (resp: any): boolean => {
+        if (!resp) return true;
+        const st = Number(resp.status || 0);
+        if (
+          st === 0 ||
+          st === 403 ||
+          st === 426 ||
+          st === 427 ||
+          st === 428 ||
+          st === 429 ||
+          st >= 500
+        ) {
+          return true;
+        }
+        const cfMit = String(resp.headers?.['cf-mitigated'] || '').toLowerCase();
+        if (cfMit.includes('challenge')) return true;
+        const buf = Buffer.isBuffer(resp.data)
+          ? resp.data
+          : Buffer.from(resp.data || []);
+        const preview = buf.slice(0, 2048).toString('utf8');
+        return (
+          preview.includes('<title>Just a moment...</title>') ||
+          preview.includes('Attention Required! | Cloudflare') ||
+          preview.includes('cf-browser-verification')
+        );
+      };
+
       const fetchProxyViaHttp2 = (
         targetUrl: string,
         reqMethod: string,
@@ -655,6 +688,7 @@ async function startServer() {
         redirectMode = 'follow',
         redirectsLeft = 8,
         overrideIp = '',
+        timeoutMs = PROXY_DIRECT_TIMEOUT_MS,
       ): Promise<{
         status: number;
         statusText: string;
@@ -673,14 +707,23 @@ async function startServer() {
               client?.close();
               reject(new Error('HTTP/2 proxy timeout'));
             }
-          }, 25000);
+          }, timeoutMs);
 
           try {
             const parsed = new URL(targetUrl);
+            const scopedOverrideIp =
+              parsed.hostname.toLowerCase() === initialHostLower
+                ? overrideIp
+                : '';
             const connectOpts: any = {
               rejectUnauthorized: false,
-              ...(overrideIp
-                ? {lookup: createHostScopedLookup(parsed.hostname, overrideIp)}
+              ...(scopedOverrideIp
+                ? {
+                    lookup: createHostScopedLookup(
+                      parsed.hostname,
+                      scopedOverrideIp,
+                    ),
+                  }
                 : {}),
             };
             client = http2.connect(parsed.origin, connectOpts);
@@ -716,7 +759,12 @@ async function startServer() {
               h2Headers[lower] = String(v);
             }
 
-            if (bodyBuf && bodyBuf.length > 0 && upperM !== 'GET' && upperM !== 'HEAD') {
+            if (
+              bodyBuf &&
+              bodyBuf.length > 0 &&
+              upperM !== 'GET' &&
+              upperM !== 'HEAD'
+            ) {
               h2Headers['content-length'] = String(bodyBuf.length);
             }
 
@@ -750,16 +798,31 @@ async function startServer() {
                   const nextMethod =
                     statusCode === 307 || statusCode === 308 ? upperM : 'GET';
                   const nextBody =
-                    statusCode === 307 || statusCode === 308 ? bodyBuf : undefined;
+                    statusCode === 307 || statusCode === 308
+                      ? bodyBuf
+                      : undefined;
+                  const mergedHeaders = {...reqHeaders};
+                  if (respHeaders['set-cookie']) {
+                    const cookieKey =
+                      Object.keys(mergedHeaders).find(
+                        k => k.toLowerCase() === 'cookie',
+                      ) || 'Cookie';
+                    mergedHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                      mergedHeaders[cookieKey],
+                      respHeaders['set-cookie'],
+                    );
+                  }
+                  const nextHost = new URL(nextUrl).hostname.toLowerCase();
                   return resolve(
                     fetchProxyViaHttp2(
                       nextUrl,
                       nextMethod,
-                      reqHeaders,
+                      mergedHeaders,
                       nextBody,
                       redirectMode,
                       redirectsLeft - 1,
-                      overrideIp,
+                      nextHost === initialHostLower ? overrideIp : '',
+                      timeoutMs,
                     ),
                   );
                 }
@@ -788,7 +851,12 @@ async function startServer() {
               }
             });
 
-            if (bodyBuf && bodyBuf.length > 0 && upperM !== 'GET' && upperM !== 'HEAD') {
+            if (
+              bodyBuf &&
+              bodyBuf.length > 0 &&
+              upperM !== 'GET' &&
+              upperM !== 'HEAD'
+            ) {
               h2Req.write(bodyBuf);
             }
             h2Req.end();
@@ -802,23 +870,73 @@ async function startServer() {
           }
         });
 
-      const fetchProxyViaHttp1 = async (overrideIp = '') => {
-        const parsed = new URL(url);
-        return axios.request({
-          url,
-          method: String(method).toUpperCase(),
-          headers: outgoingHeaders,
-          data: bodyBuffer,
-          responseType: 'arraybuffer',
-          maxRedirects: redirect === 'manual' ? 0 : 8,
-          validateStatus: () => true,
-          timeout: 30000,
-          httpsAgent: createIpScopedHttpsAgent(parsed.hostname, overrideIp),
-        });
+      const fetchProxyViaHttp1 = async (
+        overrideIp = '',
+        proxyUrl = '',
+        timeoutMs = PROXY_DIRECT_TIMEOUT_MS,
+      ) => {
+        let currentUrl = url;
+        let currentMethod = String(method).toUpperCase();
+        let currentBody = bodyBuffer;
+        let currentHeaders = {...outgoingHeaders};
+        const maxHops = redirect === 'manual' ? 0 : 8;
+
+        for (let hop = 0; hop <= maxHops; hop++) {
+          const parsed = new URL(currentUrl);
+          const scopedOverrideIp =
+            parsed.hostname.toLowerCase() === initialHostLower
+              ? overrideIp
+              : '';
+          const agent = proxyUrl
+            ? getSocksAgent(proxyUrl)
+            : createIpScopedHttpsAgent(parsed.hostname, scopedOverrideIp);
+          const resHop = await axios.request({
+            url: currentUrl,
+            method: currentMethod,
+            headers: currentHeaders,
+            data: currentBody,
+            responseType: 'arraybuffer',
+            maxRedirects: 0,
+            validateStatus: () => true,
+            timeout: timeoutMs,
+            httpAgent: proxyUrl ? agent : undefined,
+            httpsAgent: agent,
+          });
+
+          if (
+            redirect !== 'manual' &&
+            resHop.status >= 300 &&
+            resHop.status < 400 &&
+            resHop.headers?.location &&
+            hop < maxHops
+          ) {
+            if (resHop.headers['set-cookie']) {
+              const cookieKey =
+                Object.keys(currentHeaders).find(
+                  k => k.toLowerCase() === 'cookie',
+                ) || 'Cookie';
+              currentHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                currentHeaders[cookieKey],
+                resHop.headers['set-cookie'],
+              );
+            }
+            currentUrl = new URL(
+              String(resHop.headers.location),
+              currentUrl,
+            ).toString();
+            if (resHop.status !== 307 && resHop.status !== 308) {
+              currentMethod = 'GET';
+              currentBody = undefined;
+            }
+            continue;
+          }
+
+          (resHop as any).finalUrl = currentUrl;
+          return resHop;
+        }
       };
 
-      const parsedProxyUrl = new URL(url);
-      const targetHostLower = parsedProxyUrl.hostname.toLowerCase();
+      const targetHostLower = initialHostLower;
       const cachedIpEntry = workingEdgeIpCache.get(targetHostLower);
       const cachedIp =
         cachedIpEntry && Date.now() - cachedIpEntry.at < EDGE_CACHE_TTL_MS
@@ -827,21 +945,52 @@ async function startServer() {
       const isKnownH2Host = isKnownH2OrCdnHost(url);
 
       let response: any;
-      if (cachedIp) {
-        try {
-          response = isKnownH2Host
-            ? await fetchProxyViaHttp2(url, method, outgoingHeaders, bodyBuffer, redirect, 8, cachedIp)
-            : await fetchProxyViaHttp1(cachedIp);
-        } catch {
-          response = undefined;
+      let lastError: any;
+
+      const keepPreferredResponse = (candidate: any) => {
+        if (!candidate) return;
+        if (!response) {
+          response = candidate;
+          return;
         }
         if (
-          !response ||
-          response.status === 426 ||
-          response.status === 428 ||
-          response.status === 403 ||
-          response.status === 429
+          isProxyChallengeOrBlocked(response) &&
+          !isProxyChallengeOrBlocked(candidate)
         ) {
+          response = candidate;
+          return;
+        }
+        const curSt = Number(response.status || 0);
+        const newSt = Number(candidate.status || 0);
+        if (
+          (curSt === 426 || curSt === 427 || curSt === 428) &&
+          newSt !== 426 &&
+          newSt !== 427 &&
+          newSt !== 428
+        ) {
+          response = candidate;
+        }
+      };
+
+      if (cachedIp) {
+        try {
+          const cachedRes = isKnownH2Host
+            ? await fetchProxyViaHttp2(
+                url,
+                method,
+                outgoingHeaders,
+                bodyBuffer,
+                redirect,
+                8,
+                cachedIp,
+                PROXY_DIRECT_TIMEOUT_MS,
+              )
+            : await fetchProxyViaHttp1(cachedIp, '', PROXY_DIRECT_TIMEOUT_MS);
+          keepPreferredResponse(cachedRes);
+        } catch (err) {
+          lastError = err;
+        }
+        if (isProxyChallengeOrBlocked(response)) {
           workingEdgeIpCache.delete(targetHostLower);
           response = undefined;
         }
@@ -849,154 +998,197 @@ async function startServer() {
 
       if (!response && isKnownH2Host) {
         try {
-          response = await fetchProxyViaHttp2(url, method, outgoingHeaders, bodyBuffer, redirect);
-        } catch {
-          response = undefined;
+          keepPreferredResponse(
+            await fetchProxyViaHttp2(
+              url,
+              method,
+              outgoingHeaders,
+              bodyBuffer,
+              redirect,
+              8,
+              '',
+              PROXY_DIRECT_TIMEOUT_MS,
+            ),
+          );
+        } catch (err) {
+          lastError = err;
         }
       }
 
-      if (!response || response.status === 426 || response.status === 428) {
+      if (isProxyChallengeOrBlocked(response)) {
         try {
-          const axiosRes = await fetchProxyViaHttp1();
-          if (!response || (axiosRes.status !== 426 && axiosRes.status !== 428)) {
-            response = axiosRes;
-          }
-        } catch {
-          // Keep previous response if any
+          const axiosRes = await fetchProxyViaHttp1(
+            '',
+            '',
+            PROXY_DIRECT_TIMEOUT_MS,
+          );
+          keepPreferredResponse(axiosRes);
+        } catch (err) {
+          lastError = err;
         }
         if (
-          (!response || response.status === 426 || response.status === 428) &&
-          !isKnownH2Host
+          !isKnownH2Host &&
+          (!response ||
+            response.status === 426 ||
+            response.status === 427 ||
+            response.status === 428 ||
+            isProxyChallengeOrBlocked(response))
         ) {
           try {
-            const h2Fallback = await fetchProxyViaHttp2(url, method, outgoingHeaders, bodyBuffer, redirect);
-            if (h2Fallback.status < 400 || !response) {
-              response = h2Fallback;
-            }
-          } catch {
-            // Continue to alternate edge IPs
+            const h2Fallback = await fetchProxyViaHttp2(
+              url,
+              method,
+              outgoingHeaders,
+              bodyBuffer,
+              redirect,
+              8,
+              '',
+              PROXY_DIRECT_TIMEOUT_MS,
+            );
+            keepPreferredResponse(h2Fallback);
+          } catch (err) {
+            lastError = err;
           }
         }
       }
 
-      if (
-        !response ||
-        response.status === 426 ||
-        response.status === 428 ||
-        (isKnownH2Host && (response.status === 403 || response.status === 429))
-      ) {
-        const altIps = await resolveAlternateEdgeIps(parsedProxyUrl.hostname);
-        for (const ip of altIps.slice(0, 6)) {
+      if (isProxyChallengeOrBlocked(response)) {
+        const altIps = await resolveAlternateEdgeIps(initialUrlObj.hostname);
+        for (const ip of altIps.slice(0, 4)) {
           let candidate: any;
           try {
-            candidate = await fetchProxyViaHttp1(ip);
-          } catch {
+            candidate = await fetchProxyViaHttp1(ip, '', PROXY_ALT_TIMEOUT_MS);
+          } catch (err) {
+            lastError = err;
             candidate = undefined;
           }
-          if (!candidate || candidate.status === 426 || candidate.status === 428) {
+          if (
+            !candidate ||
+            candidate.status === 426 ||
+            candidate.status === 427 ||
+            candidate.status === 428
+          ) {
             try {
-              const h2Candidate = await fetchProxyViaHttp2(url, method, outgoingHeaders, bodyBuffer, redirect, 8, ip);
-              if (h2Candidate.status < 400) {
+              const h2Candidate = await fetchProxyViaHttp2(
+                url,
+                method,
+                outgoingHeaders,
+                bodyBuffer,
+                redirect,
+                8,
+                ip,
+                PROXY_ALT_TIMEOUT_MS,
+              );
+              if (!candidate || !isProxyChallengeOrBlocked(h2Candidate)) {
                 candidate = h2Candidate;
               }
-            } catch {
-              // Ignore
+            } catch (err) {
+              lastError = err;
             }
           }
-          if (candidate && candidate.status >= 200 && candidate.status < 400) {
+          keepPreferredResponse(candidate);
+          if (candidate && !isProxyChallengeOrBlocked(candidate)) {
             workingEdgeIpCache.set(targetHostLower, {at: Date.now(), ip});
-            response = candidate;
             break;
           }
         }
       }
 
-      if (!response) {
-        response = await fetchProxyViaHttp1();
+      if (isProxyChallengeOrBlocked(response) && ENV_STREAM_PROXY_URL) {
+        try {
+          const envProxyCandidate = await fetchProxyViaHttp1(
+            '',
+            ENV_STREAM_PROXY_URL,
+            PROXY_TUNNEL_TIMEOUT_MS,
+          );
+          keepPreferredResponse(envProxyCandidate);
+        } catch (err) {
+          lastError = err;
+        }
       }
 
       const upperMethod = String(method).toUpperCase();
-      const rawBuf = Buffer.isBuffer(response.data)
-        ? response.data
-        : Buffer.from(response.data || []);
-      const rawPreview = rawBuf.slice(0, 1024).toString('utf8');
-      const isCfChallenge =
-        response.status === 403 ||
-        response.status === 429 ||
-        response.status === 503 ||
-        String(response.headers?.['cf-mitigated'] || '').includes('challenge') ||
-        rawPreview.includes('<title>Just a moment...</title>') ||
-        rawPreview.includes('Attention Required! | Cloudflare');
+      const shouldTryPublicRelay =
+        upperMethod === 'GET' && isProxyChallengeOrBlocked(response);
 
-      if (upperMethod === 'GET' && isCfChallenge) {
+      if (shouldTryPublicRelay) {
         try {
-          const aoRes = await axios.get(
-            `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-            {timeout: 14000, validateStatus: () => true},
-          );
-          const contents = aoRes.data?.contents;
-          const httpCode = Number(aoRes.data?.status?.http_code || 0);
-          if (
-            aoRes.status === 200 &&
-            typeof contents === 'string' &&
-            contents.length > 0 &&
-            httpCode >= 200 &&
-            httpCode < 400 &&
-            !contents.includes('<title>Just a moment...</title>') &&
-            !contents.includes('Attention Required! | Cloudflare')
-          ) {
-            res.json({
-              status: httpCode,
-              statusText: 'OK',
-              url: aoRes.data?.status?.url || url,
-              headers: {
-                'content-type':
-                  aoRes.data?.status?.content_type ||
-                  'text/html; charset=utf-8',
-              },
-              bodyBase64: Buffer.from(contents, 'utf8').toString('base64'),
-            });
-            return;
-          }
-        } catch {
-          // Continue to codetabs
-        }
-
-        try {
-          const ctRes = await axios.get(
-            `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-            {
-              responseType: 'arraybuffer',
-              timeout: 12000,
-              validateStatus: () => true,
-            },
-          );
-          if (ctRes.status >= 200 && ctRes.status < 400 && ctRes.data) {
-            const buf = Buffer.isBuffer(ctRes.data)
-              ? ctRes.data
-              : Buffer.from(ctRes.data);
-            const preview = buf.slice(0, 1024).toString('utf8');
-            if (
-              !preview.includes('<title>Just a moment...</title>') &&
-              !preview.includes('Attention Required! | Cloudflare')
-            ) {
-              res.json({
-                status: ctRes.status,
-                statusText: 'OK',
-                url,
-                headers: {
-                  'content-type':
-                    String(ctRes.headers['content-type'] || '') ||
-                    'text/html; charset=utf-8',
+          const relayPayload = await Promise.any([
+            (async () => {
+              const aoRes = await axios.get(
+                `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+                {timeout: 5500, validateStatus: () => true},
+              );
+              const contents = aoRes.data?.contents;
+              const httpCode = Number(aoRes.data?.status?.http_code || 0);
+              if (
+                aoRes.status === 200 &&
+                typeof contents === 'string' &&
+                contents.length > 0 &&
+                httpCode >= 200 &&
+                httpCode < 400 &&
+                !contents.includes('<title>Just a moment...</title>') &&
+                !contents.includes('Attention Required! | Cloudflare')
+              ) {
+                return {
+                  status: httpCode,
+                  statusText: 'OK',
+                  url: aoRes.data?.status?.url || url,
+                  headers: {
+                    'content-type':
+                      aoRes.data?.status?.content_type ||
+                      'text/html; charset=utf-8',
+                  },
+                  bodyBase64: Buffer.from(contents, 'utf8').toString('base64'),
+                };
+              }
+              throw new Error(`AllOrigins HTTP ${httpCode || aoRes.status}`);
+            })(),
+            (async () => {
+              const ctRes = await axios.get(
+                `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+                {
+                  responseType: 'arraybuffer',
+                  timeout: 5500,
+                  validateStatus: () => true,
                 },
-                bodyBase64: buf.toString('base64'),
-              });
-              return;
-            }
-          }
+              );
+              if (ctRes.status >= 200 && ctRes.status < 400 && ctRes.data) {
+                const buf = Buffer.isBuffer(ctRes.data)
+                  ? ctRes.data
+                  : Buffer.from(ctRes.data);
+                const preview = buf.slice(0, 1024).toString('utf8');
+                if (
+                  !preview.includes('<title>Just a moment...</title>') &&
+                  !preview.includes('Attention Required! | Cloudflare')
+                ) {
+                  return {
+                    status: ctRes.status,
+                    statusText: 'OK',
+                    url,
+                    headers: {
+                      'content-type':
+                        String(ctRes.headers['content-type'] || '') ||
+                        'text/html; charset=utf-8',
+                    },
+                    bodyBase64: buf.toString('base64'),
+                  };
+                }
+              }
+              throw new Error(`CodeTabs HTTP ${ctRes.status}`);
+            })(),
+          ]);
+          res.json(relayPayload);
+          return;
         } catch {
-          // Return original response
+          // Return upstream response or throw lastError below
         }
+      }
+
+      if (!response) {
+        throw (
+          lastError || new Error(`Upstream request timed out or failed for ${url}`)
+        );
       }
 
       const responseHeaders: Record<string, string> = {};
@@ -1338,52 +1530,65 @@ async function startServer() {
           ':path': parsed.pathname + parsed.search,
         };
 
-        for (const [k, v] of Object.entries(outgoingHeaders)) {
-          const lower = k.toLowerCase();
-          if (
-            lower === 'host' ||
-            lower === 'connection' ||
-            lower === 'keep-alive' ||
-            lower === 'transfer-encoding' ||
-            lower === 'upgrade' ||
-            lower === 'http2-settings'
-          ) {
-            continue;
+          for (const [k, v] of Object.entries(outgoingHeaders)) {
+            const lower = k.toLowerCase();
+            if (
+              lower === 'host' ||
+              lower === 'connection' ||
+              lower === 'keep-alive' ||
+              lower === 'transfer-encoding' ||
+              lower === 'upgrade' ||
+              lower === 'http2-settings' ||
+              lower === 'accept-encoding'
+            ) {
+              continue;
+            }
+            h2Headers[lower] = String(v);
           }
-          h2Headers[lower] = String(v);
-        }
+          h2Headers['accept-encoding'] = 'identity';
 
-        h2Req = client.request(h2Headers);
+          h2Req = client.request(h2Headers);
 
-        h2Req.on('response', respHeaders => {
-          if (settled) return;
-          const statusCode = Number(respHeaders[':status'] || 200);
+          h2Req.on('response', respHeaders => {
+            if (settled) return;
+            const statusCode = Number(respHeaders[':status'] || 200);
 
-          if (
-            statusCode >= 300 &&
-            statusCode < 400 &&
-            respHeaders['location'] &&
-            redirectsLeft > 0
-          ) {
-            settled = true;
-            clearTimeout(timer);
-            h2Req?.destroy();
-            client?.close();
-            const redirectUrl = new URL(
-              String(respHeaders['location']),
-              targetUrl,
-            ).toString();
-            openHttp2Stream(
-              redirectUrl,
-              outgoingHeaders,
-              method,
-              redirectsLeft - 1,
-              overrideIp,
-            )
-              .then(resolve)
-              .catch(reject);
-            return;
-          }
+            if (
+              statusCode >= 300 &&
+              statusCode < 400 &&
+              respHeaders['location'] &&
+              redirectsLeft > 0
+            ) {
+              settled = true;
+              clearTimeout(timer);
+              h2Req?.destroy();
+              client?.close();
+              const redirectUrl = new URL(
+                String(respHeaders['location']),
+                targetUrl,
+              ).toString();
+              const mergedHeaders = {...outgoingHeaders};
+              if (respHeaders['set-cookie']) {
+                const cookieKey =
+                  Object.keys(mergedHeaders).find(
+                    k => k.toLowerCase() === 'cookie',
+                  ) || 'Cookie';
+                mergedHeaders[cookieKey] = mergeCookiesFromSetCookie(
+                  mergedHeaders[cookieKey],
+                  respHeaders['set-cookie'],
+                );
+              }
+              openHttp2Stream(
+                redirectUrl,
+                mergedHeaders,
+                method,
+                redirectsLeft - 1,
+                overrideIp,
+              )
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
 
           settled = true;
           clearTimeout(timer);
@@ -1444,7 +1649,10 @@ async function startServer() {
     proxyUrl = '',
   ) {
     let currentUrl = targetUrl;
-    const currentHeaders: Record<string, string> = {...outgoingHeaders};
+    const currentHeaders: Record<string, string> = {
+      ...outgoingHeaders,
+      'Accept-Encoding': 'identity',
+    };
     const maxHops = 8;
 
     for (let hop = 0; hop <= maxHops; hop++) {
@@ -1457,6 +1665,7 @@ async function startServer() {
         method: method === 'HEAD' ? 'HEAD' : 'GET',
         headers: currentHeaders,
         responseType: 'stream',
+        decompress: false,
         maxRedirects: 0,
         validateStatus: () => true,
         timeout: 30000,
@@ -1731,6 +1940,14 @@ async function startServer() {
       }
 
       res.status(upstream.status);
+      const upstreamEncoding = String(
+        upstream.headers['content-encoding'] || '',
+      )
+        .trim()
+        .toLowerCase();
+      if (upstreamEncoding && upstreamEncoding !== 'identity') {
+        res.setHeader('content-encoding', upstreamEncoding);
+      }
       const forwardHeaders = [
         'content-length',
         'content-range',

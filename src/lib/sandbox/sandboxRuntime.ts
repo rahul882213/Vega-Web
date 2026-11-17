@@ -108,6 +108,60 @@ function decodeBase64ToUtf8(base64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+function isWafChallengeHtml(text?: string | null): boolean {
+  if (!text || typeof text !== 'string') return false;
+  return (
+    text.includes('<title>Just a moment...</title>') ||
+    text.includes('Attention Required! | Cloudflare') ||
+    text.includes('challenges.cloudflare.com') ||
+    text.includes('cf-chl-widget')
+  );
+}
+
+async function serializeFormDataToMultipart(
+  formData: FormData,
+): Promise<{bodyBytes: Uint8Array; contentType: string}> {
+  const boundary = `----VegaWebFormBoundary${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+
+  for (const [key, value] of formData.entries()) {
+    const escapedName = String(key).replace(/"/g, '\\"');
+    if (typeof value === 'string') {
+      const partHeader = `--${boundary}\r\nContent-Disposition: form-data; name="${escapedName}"\r\n\r\n`;
+      chunks.push(encoder.encode(partHeader));
+      chunks.push(encoder.encode(value));
+      chunks.push(encoder.encode('\r\n'));
+    } else {
+      const blob = value as Blob;
+      const filename =
+        typeof (value as File).name === 'string' && (value as File).name
+          ? (value as File).name.replace(/"/g, '\\"')
+          : 'blob';
+      const mimeType = blob.type || 'application/octet-stream';
+      const partHeader = `--${boundary}\r\nContent-Disposition: form-data; name="${escapedName}"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`;
+      chunks.push(encoder.encode(partHeader));
+      chunks.push(new Uint8Array(await blob.arrayBuffer()));
+      chunks.push(encoder.encode('\r\n'));
+    }
+  }
+
+  chunks.push(encoder.encode(`--${boundary}--\r\n`));
+
+  const totalLen = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+  const combined = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    combined.set(c, offset);
+    offset += c.byteLength;
+  }
+
+  return {
+    bodyBytes: combined,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
+
 function getCookieJar(author: string): Record<string, Record<string, string>> {
   const key = `jar_${(author || 'default').toLowerCase()}`;
   return providerCookieStorage.getObject<Record<string, Record<string, string>>>(
@@ -326,8 +380,12 @@ export async function proxyFetch(
 
   // 1. Fast path for CORS-enabled public hosts (GitHub Raw, JSDelivr, GitHub Pages, TMDB, Cinemeta)
   if (method === 'GET' && isCorsSafeDirectHost(url) && !storedCookie) {
-    // Serve deduplicated & dynamically portal-resolved urls.json for vega-providers
-    if (url.includes('vega-providers') && url.endsWith('/urls.json')) {
+    // Only apply Zenda-Cross + Punisher mirror enrichment specifically for Zenda-Cross urls.json.
+    // Custom sources (e.g. rahul882213/vega-providers-toonworld) must fetch their own real urls.json untouched.
+    const isZendaUrlsJson =
+      /raw\.githubusercontent\.com\/zenda-cross\/vega-providers\//i.test(url) &&
+      url.endsWith('/urls.json');
+    if (isZendaUrlsJson) {
       try {
         const enrichedMap = await getEnrichedUrlsMap();
         if (enrichedMap && Object.keys(enrichedMap).length > 0) {
@@ -402,12 +460,15 @@ export async function proxyFetch(
     bodyText: string;
   } | null = null;
 
+  const attemptErrors: string[] = [];
+
   const tryProxyEndpoint = async (endpoint: string) => {
+    const isRemote = endpoint.startsWith('http');
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: proxyPayload,
-      signal: withTimeoutSignal(init?.signal, 22000),
+      signal: withTimeoutSignal(init?.signal, isRemote ? 28000 : 24000),
     });
 
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -448,12 +509,12 @@ export async function proxyFetch(
           data.status === 429 ||
           data.status === 503 ||
           String(responseHeaders['cf-mitigated'] || '').includes('challenge') ||
-          bodyText.includes('<title>Just a moment...</title>') ||
-          bodyText.includes('Attention Required! | Cloudflare');
+          isWafChallengeHtml(bodyText);
 
         return {skip: false as const, isCfBlocked, parsedResult};
       }
     }
+    attemptErrors.push(`${endpoint} -> HTTP ${res.status}`);
     return {skip: true as const};
   };
 
@@ -463,11 +524,16 @@ export async function proxyFetch(
       if (outcome.skip) continue;
       if (outcome.isCfBlocked) {
         blockedResult = outcome.parsedResult;
+        attemptErrors.push(
+          `${endpoint} -> upstream HTTP ${outcome.parsedResult.status}`,
+        );
         continue;
       }
       return outcome.parsedResult;
-    } catch {
-      // Try next endpoint
+    } catch (err: any) {
+      attemptErrors.push(
+        `${endpoint} -> ${err?.message || 'request error'}`,
+      );
     }
   }
 
@@ -480,9 +546,15 @@ export async function proxyFetch(
           return edgeOutcome.parsedResult;
         }
         blockedResult = edgeOutcome.parsedResult;
+        attemptErrors.push(
+          `${edgeEndpoint} -> upstream HTTP ${edgeOutcome.parsedResult.status}`,
+        );
       }
-    } catch {
+    } catch (err: any) {
       edgeProxyUnsupported = true;
+      attemptErrors.push(
+        `${edgeEndpoint} -> ${err?.message || 'request error'}`,
+      );
     }
   }
 
@@ -579,7 +651,18 @@ export async function proxyFetch(
         ),
       ]);
     } catch (err: any) {
-      lastError = err instanceof Error ? err : new Error(String(err));
+      const nestedErrors =
+        Array.isArray(err?.errors) && err.errors.length > 0
+          ? err.errors
+              .map((e: any) => (e instanceof Error ? e.message : String(e)))
+              .join('; ')
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      const summary = [...attemptErrors, nestedErrors]
+        .filter(Boolean)
+        .join(' | ');
+      lastError = new Error(summary || `Failed to fetch ${url}`);
     }
   }
 
@@ -589,7 +672,11 @@ export async function proxyFetch(
 
   throw (
     lastError ||
-    new Error(`Failed to fetch ${url} via proxy and CORS fallbacks`)
+    new Error(
+      attemptErrors.length > 0
+        ? `Failed to fetch ${url}: ${attemptErrors.join(' | ')}`
+        : `Failed to fetch ${url} via proxy and CORS fallbacks`,
+    )
   );
 }
 
@@ -622,8 +709,22 @@ function createProviderFetchFunction(author: string) {
     let bodyPayload: string | Uint8Array | null = null;
     if (typeof init?.body === 'string') {
       bodyPayload = init.body;
+    } else if (
+      typeof FormData !== 'undefined' &&
+      init?.body instanceof FormData
+    ) {
+      const serialized = await serializeFormDataToMultipart(init.body);
+      bodyPayload = serialized.bodyBytes;
+      for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() === 'content-type') delete headers[k];
+      }
+      headers['Content-Type'] = serialized.contentType;
     } else if (init?.body instanceof URLSearchParams) {
       bodyPayload = init.body.toString();
+      if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+        headers['Content-Type'] =
+          'application/x-www-form-urlencoded;charset=UTF-8';
+      }
     } else if (init?.body instanceof ArrayBuffer) {
       bodyPayload = new Uint8Array(init.body);
     } else if (ArrayBuffer.isView(init?.body)) {
@@ -696,8 +797,22 @@ function createProviderAxios(author: string) {
     if (config.data !== undefined && config.data !== null) {
       if (typeof config.data === 'string') {
         body = config.data;
+      } else if (
+        typeof FormData !== 'undefined' &&
+        config.data instanceof FormData
+      ) {
+        const serialized = await serializeFormDataToMultipart(config.data);
+        body = serialized.bodyBytes;
+        for (const k of Object.keys(headers)) {
+          if (k.toLowerCase() === 'content-type') delete headers[k];
+        }
+        headers['Content-Type'] = serialized.contentType;
       } else if (config.data instanceof URLSearchParams) {
         body = config.data.toString();
+        if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+          headers['Content-Type'] =
+            'application/x-www-form-urlencoded;charset=UTF-8';
+        }
       } else if (config.data instanceof Uint8Array) {
         body = config.data;
       } else if (typeof config.data === 'object') {
@@ -838,6 +953,9 @@ function createProviderAxios(author: string) {
       config,
       request: {
         responseURL: proxied.url,
+        res: {
+          responseUrl: proxied.url,
+        },
       },
     };
 
@@ -1075,7 +1193,8 @@ export function createProviderContext(
     cheerio,
     Crypto: cryptoShim,
     commonHeaders: COMMON_HEADERS,
-    getBaseUrl,
+    getBaseUrl: (targetProvider: string) =>
+      getBaseUrl(targetProvider, author),
     getCookies: async (url: string) => getCookiesForUrl(author, url),
     openWebView: async (
       url: string,
@@ -1167,12 +1286,19 @@ export function createProviderContext(
         const [k, v] = part.split('=').map(s => s.trim());
         if (k && v !== undefined) cookieMap[k] = v;
       });
+      const cleanHtml =
+        proxied.status >= 200 &&
+        proxied.status < 400 &&
+        !isWafChallengeHtml(proxied.bodyText)
+          ? proxied.bodyText
+          : '';
       return {
         cookies: cookieHeader,
         cookie: cookieHeader,
         cookieMap,
         cookieHeader,
-        html: proxied.bodyText,
+        html: cleanHtml || proxied.bodyText,
+        data: cleanHtml || undefined,
         url: proxied.url || url,
         userAgent: COMMON_HEADERS['User-Agent'],
       };
@@ -1419,6 +1545,56 @@ export async function runProviderEpisodes(
   return Array.isArray(res) ? res : [];
 }
 
+async function normalizeStreamResults(raw: unknown): Promise<Stream[]> {
+  const flatten = async (item: unknown, depth = 0): Promise<any[]> => {
+    if (!item || depth > 4) return [];
+    const resolved =
+      typeof (item as any)?.then === 'function' ? await item : item;
+    if (Array.isArray(resolved)) {
+      const settled = await Promise.allSettled(
+        resolved.map(sub => flatten(sub, depth + 1)),
+      );
+      return settled.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+    }
+    return resolved && typeof resolved === 'object' ? [resolved] : [];
+  };
+
+  const flattened = await flatten(raw);
+  const seenLinks = new Set<string>();
+  const normalized: Stream[] = [];
+
+  for (const entry of flattened) {
+    if (!entry || typeof entry.link !== 'string') continue;
+    const link = entry.link.trim();
+    if (!link || seenLinks.has(link)) continue;
+    seenLinks.add(link);
+
+    const lower = link.toLowerCase();
+    const rawType = typeof entry.type === 'string' ? entry.type.trim() : '';
+    const inferredType =
+      rawType ||
+      (lower.includes('.m3u8')
+        ? 'm3u8'
+        : lower.includes('.mpd')
+          ? 'mpd'
+          : lower.includes('.mkv')
+            ? 'mkv'
+            : 'mp4');
+
+    normalized.push({
+      ...entry,
+      server:
+        typeof entry.server === 'string' && entry.server.trim()
+          ? entry.server.trim()
+          : 'Server',
+      link,
+      type: inferredType,
+    });
+  }
+
+  return normalized;
+}
+
 export async function runProviderStream(
   code: string,
   params: {
@@ -1449,7 +1625,7 @@ export async function runProviderStream(
     signal: params.signal || new AbortController().signal,
     providerContext,
   });
-  return Array.isArray(res) ? res : [];
+  return await normalizeStreamResults(res);
 }
 
 export async function runProviderSettingsSchema(

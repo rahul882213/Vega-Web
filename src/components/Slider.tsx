@@ -3,6 +3,8 @@ import {Post} from '../lib/providers/types';
 import {useM3Colors} from '../theme/M3PaletteContext';
 import {useVegaNavigation} from '../NavigationContext';
 import useContentStore from '../lib/zustand/contentStore';
+import {useHorizontalCarousel} from '../lib/hooks/useHorizontalCarousel';
+import {CarouselArrowButton} from './CarouselArrowButton';
 
 interface SliderProps {
   isLoading: boolean;
@@ -24,6 +26,14 @@ export const Slider: React.FC<SliderProps> = ({
   const colors = useM3Colors();
   const {navigate} = useVegaNavigation();
   const {provider} = useContentStore();
+  const {
+    containerRef,
+    canScrollLeft,
+    canScrollRight,
+    updateScrollState,
+    scrollByPage,
+    handleKeyDown,
+  } = useHorizontalCarousel(posts.length);
 
   const targetProvider = providerValue || provider.value;
 
@@ -77,51 +87,75 @@ export const Slider: React.FC<SliderProps> = ({
           </p>
         </div>
       ) : (
-        <div className="flex items-start gap-3 overflow-x-auto pb-2 no-scrollbar">
-          {posts.map((item, idx) => (
-            <button
-              key={`${item.link}-${idx}`}
-              onClick={() =>
-                navigate({
-                  name: 'Info',
-                  params: {
-                    link: item.link,
-                    provider: item.provider || targetProvider,
-                    poster: item.image,
-                  },
-                })
-              }
-              className="w-[112px] shrink-0 text-left group cursor-pointer focus:outline-none">
-              <div
-                className="w-[112px] h-[166px] rounded-xl overflow-hidden border transition-transform duration-200 group-hover:scale-[1.03]"
-                style={{
-                  backgroundColor: colors.surfaceContainerHigh,
-                  borderColor: 'rgba(255,255,255,0.06)',
-                }}>
-                {item.image ? (
-                  <img
-                    src={item.image}
-                    alt={item.title}
-                    loading="lazy"
-                    className="w-full h-full object-cover"
-                    onError={e => {
-                      (e.currentTarget as HTMLImageElement).src =
-                        'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
-                    }}
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center p-2 text-center text-xs opacity-50">
-                    {item.title}
-                  </div>
-                )}
-              </div>
-              <p
-                className="text-xs mt-1.5 line-clamp-2 leading-snug font-medium"
-                style={{color: colors.onSurface}}>
-                {item.title}
-              </p>
-            </button>
-          ))}
+        <div
+          className="relative group/carousel"
+          onKeyDown={handleKeyDown}>
+          <CarouselArrowButton
+            direction="left"
+            visible={canScrollLeft}
+            onClick={() => scrollByPage('left')}
+            verticalCenterClass="top-[83px]"
+          />
+          <div
+            ref={containerRef}
+            onScroll={updateScrollState}
+            className="flex items-start gap-3 overflow-x-auto pb-2 no-scrollbar scroll-smooth snap-x md:snap-none">
+            {posts.map((item, idx) => (
+              <button
+                key={`${item.link}-${idx}`}
+                onClick={() =>
+                  navigate({
+                    name: 'Info',
+                    params: {
+                      link: item.link,
+                      provider: item.provider || targetProvider,
+                      poster: item.image,
+                    },
+                  })
+                }
+                className="w-[112px] shrink-0 snap-start text-left group cursor-pointer focus:outline-none">
+                <div
+                  className="w-[112px] h-[166px] rounded-xl overflow-hidden border transition-transform duration-200 group-hover:scale-[1.03]"
+                  style={{
+                    backgroundColor: colors.surfaceContainerHigh,
+                    borderColor: 'rgba(255,255,255,0.06)',
+                  }}>
+                  {item.image ? (
+                    <img
+                      src={item.image}
+                      alt={item.title}
+                      loading="lazy"
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover"
+                      onError={e => {
+                        const img = e.currentTarget as HTMLImageElement;
+                        if (!img.dataset.fallbackApplied) {
+                          img.dataset.fallbackApplied = '1';
+                          img.src =
+                            'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
+                        }
+                      }}
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center p-2 text-center text-xs opacity-50">
+                      {item.title}
+                    </div>
+                  )}
+                </div>
+                <p
+                  className="text-xs mt-1.5 line-clamp-2 leading-snug font-medium"
+                  style={{color: colors.onSurface}}>
+                  {item.title}
+                </p>
+              </button>
+            ))}
+          </div>
+          <CarouselArrowButton
+            direction="right"
+            visible={canScrollRight}
+            onClick={() => scrollByPage('right')}
+            verticalCenterClass="top-[83px]"
+          />
         </div>
       )}
     </div>

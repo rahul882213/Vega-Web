@@ -5,11 +5,21 @@ import useContinueWatchingStore, {
   ContinueWatchingItem,
 } from '../lib/zustand/continueWatchingStore';
 import {useVegaNavigation} from '../NavigationContext';
+import {useHorizontalCarousel} from '../lib/hooks/useHorizontalCarousel';
+import {CarouselArrowButton} from './CarouselArrowButton';
 
 export const ContinueWatching: React.FC = () => {
   const colors = useM3Colors();
   const {items, removeItem} = useContinueWatchingStore();
   const {navigate} = useVegaNavigation();
+  const {
+    containerRef,
+    canScrollLeft,
+    canScrollRight,
+    updateScrollState,
+    scrollByPage,
+    handleKeyDown,
+  } = useHorizontalCarousel(items.length);
 
   if (!items || items.length === 0) return null;
 
@@ -43,83 +53,109 @@ export const ContinueWatching: React.FC = () => {
         </h3>
       </div>
 
-      <div className="flex items-start gap-3 overflow-x-auto pb-2 no-scrollbar">
-        {items.map(item => {
-          const pct =
-            item.duration > 0
-              ? Math.min(100, Math.max(4, (item.position / item.duration) * 100))
-              : 0;
-          return (
-            <div
-              key={item.id}
-              className="w-[152px] shrink-0 group relative cursor-pointer"
-              onClick={() => handleResume(item)}>
+      <div className="relative group/carousel" onKeyDown={handleKeyDown}>
+        <CarouselArrowButton
+          direction="left"
+          visible={canScrollLeft}
+          onClick={() => scrollByPage('left')}
+          verticalCenterClass="top-[105px]"
+        />
+        <div
+          ref={containerRef}
+          onScroll={updateScrollState}
+          className="flex items-start gap-3 overflow-x-auto pb-2 no-scrollbar scroll-smooth snap-x md:snap-none">
+          {items.map(item => {
+            const pct =
+              item.duration > 0
+                ? Math.min(100, Math.max(4, (item.position / item.duration) * 100))
+                : 0;
+            return (
               <div
-                className="w-[152px] h-[210px] rounded-xl overflow-hidden relative border"
-                style={{
-                  backgroundColor: colors.surfaceContainerHigh,
-                  borderColor: 'rgba(255,255,255,0.08)',
-                }}>
-                {item.poster ? (
-                  <img
-                    src={item.poster}
-                    alt={item.title}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center p-2 text-xs text-center opacity-60">
-                    {item.title}
+                key={item.id}
+                className="w-[152px] shrink-0 snap-start group relative cursor-pointer"
+                onClick={() => handleResume(item)}>
+                <div
+                  className="w-[152px] h-[210px] rounded-xl overflow-hidden relative border"
+                  style={{
+                    backgroundColor: colors.surfaceContainerHigh,
+                    borderColor: 'rgba(255,255,255,0.08)',
+                  }}>
+                  {item.poster ? (
+                    <img
+                      src={item.poster}
+                      alt={item.title}
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover"
+                      onError={e => {
+                        const img = e.currentTarget as HTMLImageElement;
+                        if (!img.dataset.fallbackApplied) {
+                          img.dataset.fallbackApplied = '1';
+                          img.src =
+                            'https://placehold.jp/24/262626/999999/300x450.png?text=Poster';
+                        }
+                      }}
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center p-2 text-xs text-center opacity-60">
+                      {item.title}
+                    </div>
+                  )}
+
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent flex items-center justify-center">
+                    <div
+                      className="w-10 h-10 rounded-full flex items-center justify-center shadow-lg transition-transform group-hover:scale-110"
+                      style={{
+                        backgroundColor: colors.primary,
+                        color: colors.onPrimary,
+                      }}>
+                      <Play size={16} fill="currentColor" />
+                    </div>
                   </div>
-                )}
 
-                <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent flex items-center justify-center">
-                  <div
-                    className="w-10 h-10 rounded-full flex items-center justify-center shadow-lg transition-transform group-hover:scale-110"
-                    style={{
-                      backgroundColor: colors.primary,
-                      color: colors.onPrimary,
-                    }}>
-                    <Play size={16} fill="currentColor" />
-                  </div>
-                </div>
-
-                <button
-                  onClick={e => {
-                    e.stopPropagation();
-                    removeItem(item.id);
-                  }}
-                  className="absolute top-2 right-2 w-6 h-6 rounded-full bg-black/70 flex items-center justify-center text-white/80 hover:text-white cursor-pointer"
-                  title="Remove from Continue Watching">
-                  <X size={13} />
-                </button>
-
-                {/* Progress Bar */}
-                <div className="absolute inset-x-0 bottom-0 h-1.5 bg-white/25">
-                  <div
-                    className="h-full"
-                    style={{
-                      width: `${pct}%`,
-                      backgroundColor: colors.primary,
+                  <button
+                    onClick={e => {
+                      e.stopPropagation();
+                      removeItem(item.id);
                     }}
-                  />
-                </div>
-              </div>
+                    className="absolute top-2 right-2 w-6 h-6 rounded-full bg-black/70 flex items-center justify-center text-white/80 hover:text-white cursor-pointer"
+                    title="Remove from Continue Watching">
+                    <X size={13} />
+                  </button>
 
-              <p
-                className="text-xs font-semibold mt-1.5 truncate"
-                style={{color: colors.onSurface}}>
-                {item.title}
-              </p>
-              {item.episodeTitle && (
+                  {/* Progress Bar */}
+                  <div className="absolute inset-x-0 bottom-0 h-1.5 bg-white/25">
+                    <div
+                      className="h-full"
+                      style={{
+                        width: `${pct}%`,
+                        backgroundColor: colors.primary,
+                      }}
+                    />
+                  </div>
+                </div>
+
                 <p
-                  className="text-[11px] truncate"
-                  style={{color: colors.onSurfaceVariant}}>
-                  {item.episodeTitle}
+                  className="text-xs font-semibold mt-1.5 truncate"
+                  style={{color: colors.onSurface}}>
+                  {item.title}
                 </p>
-              )}
-            </div>
-          );
-        })}
+                {item.episodeTitle && (
+                  <p
+                    className="text-[11px] truncate"
+                    style={{color: colors.onSurfaceVariant}}>
+                    {item.episodeTitle}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <CarouselArrowButton
+          direction="right"
+          visible={canScrollRight}
+          onClick={() => scrollByPage('right')}
+          verticalCenterClass="top-[105px]"
+        />
       </div>
     </div>
   );

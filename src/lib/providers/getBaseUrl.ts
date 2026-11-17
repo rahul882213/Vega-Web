@@ -1,5 +1,6 @@
 import {
   cacheStorageService,
+  extensionStorage,
   getEffectiveApiBaseUrl,
   isStaticOrGitHubPagesHost,
   settingsStorage,
@@ -7,6 +8,7 @@ import {
 
 const EXPIRE_TIME = 60 * 60 * 1000;
 const ENRICH_CACHE_TTL = 10 * 60 * 1000;
+const SOURCE_URLS_CACHE_TTL = 30 * 60 * 1000;
 const ZENDA_URLS_JSON_URL =
   'https://raw.githubusercontent.com/Zenda-Cross/vega-providers/refs/heads/main/urls.json';
 const PUNISHER_MODFLIX_JSON_URL =
@@ -35,6 +37,15 @@ export interface BaseUrlEntry {
 let memoryModflixCache: Record<string, BaseUrlEntry> | null = null;
 let memoryModflixFetchedAt = 0;
 let inflightModflixPromise: Promise<Record<string, BaseUrlEntry>> | null = null;
+
+const sourceUrlsCache = new Map<
+  string,
+  {at: number; map: Record<string, BaseUrlEntry>}
+>();
+const inflightSourceUrls = new Map<
+  string,
+  Promise<Record<string, BaseUrlEntry>>
+>();
 
 export function isStaleUrl(raw?: string | null): boolean {
   if (!raw) return false;
@@ -98,6 +109,112 @@ async function resolvePortalUrlViaProxy(
     // Fall back to verified mirror
   }
   return fallbackUrl;
+}
+
+async function fetchJsonDirectOrProxy(
+  url: string,
+  timeoutMs: number,
+): Promise<Record<string, BaseUrlEntry> | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        return data as Record<string, BaseUrlEntry>;
+      }
+    }
+  } catch {
+    // Fall back to proxy below
+  } finally {
+    clearTimeout(timer);
+  }
+
+  try {
+    const controller2 = new AbortController();
+    const timer2 = setTimeout(() => controller2.abort(), timeoutMs);
+    const proxyRes = await fetch(getProxyEndpoint(), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, method: 'GET', redirect: 'follow'}),
+      signal: controller2.signal,
+    }).finally(() => clearTimeout(timer2));
+    if (proxyRes.ok) {
+      const payload = await proxyRes.json();
+      if (payload?.status >= 200 && payload?.status < 300 && payload?.bodyBase64) {
+        const parsed = JSON.parse(decodeBase64Utf8(payload.bodyBase64));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, BaseUrlEntry>;
+        }
+      }
+    }
+  } catch {
+    // Ignore fallback failure
+  }
+  return null;
+}
+
+async function getSourceUrlsMap(
+  sourceAuthor?: string,
+): Promise<Record<string, BaseUrlEntry> | null> {
+  const normalizedAuthor = (sourceAuthor || '').trim();
+  if (
+    !normalizedAuthor ||
+    normalizedAuthor.toLowerCase() === 'zenda-cross' ||
+    normalizedAuthor.toLowerCase() === 'default'
+  ) {
+    return null;
+  }
+
+  const matchedSource = extensionStorage
+    .getProviderSources()
+    .find(s => s.author.toLowerCase() === normalizedAuthor.toLowerCase());
+  const sourceBaseUrl = matchedSource?.url?.replace(/\/+$/, '');
+  if (!sourceBaseUrl) {
+    return null;
+  }
+
+  const cacheKey = sourceBaseUrl.toLowerCase();
+  const cached = sourceUrlsCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < SOURCE_URLS_CACHE_TTL) {
+    return cached.map;
+  }
+
+  const inflight = inflightSourceUrls.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const promise = (async () => {
+    const rawMap = await fetchJsonDirectOrProxy(`${sourceBaseUrl}/urls.json`, 8000);
+    if (rawMap && Object.keys(rawMap).length > 0) {
+      sourceUrlsCache.set(cacheKey, {at: Date.now(), map: rawMap});
+      return rawMap;
+    }
+    return cached?.map || {};
+  })().finally(() => {
+    inflightSourceUrls.delete(cacheKey);
+  });
+
+  inflightSourceUrls.set(cacheKey, promise);
+  return promise;
+}
+
+function findUrlEntry(
+  map: Record<string, BaseUrlEntry>,
+  providerValue: string,
+): BaseUrlEntry | undefined {
+  if (!map || !providerValue) return undefined;
+  return (
+    map[providerValue] ||
+    Object.entries(map).find(
+      ([k]) => k.toLowerCase() === providerValue.toLowerCase(),
+    )?.[1]
+  );
 }
 
 async function buildEnrichedModflixMap(): Promise<Record<string, BaseUrlEntry>> {
@@ -206,9 +323,21 @@ export async function getEnrichedUrlsMap(
   return promise;
 }
 
-export const getBaseUrl = async (providerValue: string): Promise<string> => {
-  const cacheKey = 'CacheBaseUrl' + providerValue;
-  const timeKey = 'baseUrlTime' + providerValue;
+export const getBaseUrl = async (
+  providerValue: string,
+  sourceAuthor?: string,
+): Promise<string> => {
+  const effectiveAuthor =
+    (sourceAuthor || extensionStorage.getDefaultProviderSource()?.author || 'default')
+      .trim()
+      .toLowerCase();
+  const isCustomNonZendaSource =
+    Boolean(effectiveAuthor) &&
+    effectiveAuthor !== 'zenda-cross' &&
+    effectiveAuthor !== 'default';
+
+  const cacheKey = `CacheBaseUrl:${effectiveAuthor}:${providerValue}`;
+  const timeKey = `baseUrlTime:${effectiveAuthor}:${providerValue}`;
 
   try {
     const cachedUrl = cacheStorageService.getString(cacheKey);
@@ -225,7 +354,25 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
       return cachedUrl;
     }
 
-    // 1. Try backend /api/base-url endpoint (when not using outdated/empty response)
+    // 1. For non-Zenda sources (e.g. rahul882213), resolve directly from that source's own urls.json first
+    if (isCustomNonZendaSource) {
+      const sourceMap = await getSourceUrlsMap(sourceAuthor || effectiveAuthor);
+      const sourceEntry = sourceMap
+        ? findUrlEntry(sourceMap, providerValue)
+        : undefined;
+      if (
+        sourceEntry?.url &&
+        typeof sourceEntry.url === 'string' &&
+        !isStaleUrl(sourceEntry.url)
+      ) {
+        const cleanUrl = sourceEntry.url.trim().replace(/\/+$/, '');
+        cacheStorageService.setString(cacheKey, cleanUrl);
+        cacheStorageService.setObject(timeKey, Date.now());
+        return cleanUrl;
+      }
+    }
+
+    // 2. Try backend /api/base-url endpoint (Zenda-Cross / Punisher mirrors)
     try {
       const apiPrefix = getEffectiveApiBaseUrl();
       const controller = new AbortController();
@@ -251,13 +398,9 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
       // Fall through to direct GitHub + portal lookup
     }
 
-    // 2. Fallback: Fetch & enrich urls.json directly in browser
+    // 3. Fallback: Fetch & enrich Zenda urls.json directly in browser
     const map = await getEnrichedUrlsMap();
-    const entry =
-      map[providerValue] ||
-      Object.entries(map).find(
-        ([k]) => k.toLowerCase() === providerValue.toLowerCase(),
-      )?.[1];
+    const entry = findUrlEntry(map, providerValue);
 
     if (entry?.url && typeof entry.url === 'string') {
       cacheStorageService.setString(cacheKey, entry.url);
@@ -272,4 +415,5 @@ export const getBaseUrl = async (providerValue: string): Promise<string> => {
     return fallback && !isStaleUrl(fallback) ? fallback : '';
   }
 };
+
 

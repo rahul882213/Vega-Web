@@ -126,6 +126,42 @@ function convertSrtToVtt(srtText: string): string {
   return `WEBVTT\n\n${cleaned}`;
 }
 
+function parseVttTimestampToMs(ts: string): number {
+  const parts = ts.trim().split(':');
+  if (parts.length === 2) {
+    const [m, secMs] = parts;
+    const [s, ms = '0'] = secMs.split('.');
+    return (Number(m) * 60 + Number(s)) * 1000 + Number(ms.padEnd(3, '0').slice(0, 3));
+  }
+  if (parts.length === 3) {
+    const [h, m, secMs] = parts;
+    const [s, ms = '0'] = secMs.split('.');
+    return (Number(h) * 3600 + Number(m) * 60 + Number(s)) * 1000 + Number(ms.padEnd(3, '0').slice(0, 3));
+  }
+  return 0;
+}
+
+function formatMsToVttTimestamp(msTotal: number): string {
+  const clamped = Math.max(0, Math.round(msTotal));
+  const hrs = Math.floor(clamped / 3600000);
+  const mins = Math.floor((clamped % 3600000) / 60000);
+  const secs = Math.floor((clamped % 60000) / 1000);
+  const ms = clamped % 1000;
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+function shiftVttTimestamps(vttText: string, delayMs: number): string {
+  if (!delayMs) return vttText;
+  return vttText.replace(
+    /((?:\d{1,2}:)?\d{2}:\d{2}\.\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}\.\d{3})/g,
+    (_match, startStr, endStr) => {
+      const startMs = Math.max(0, parseVttTimestampToMs(startStr) + delayMs);
+      const endMs = Math.max(startMs + 200, parseVttTimestampToMs(endStr) + delayMs);
+      return `${formatMsToVttTimestamp(startMs)} --> ${formatMsToVttTimestamp(endMs)}`;
+    },
+  );
+}
+
 function formatTime(sec: number, showHoursForce = false): string {
   if (!Number.isFinite(sec) || sec < 0) return '00:00';
   const total = Math.floor(sec);
@@ -182,12 +218,17 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const dashRef = useRef<dashjs.MediaPlayerClass | null>(null);
   const subFileInputRef = useRef<HTMLInputElement>(null);
   const localVideoInputRef = useRef<HTMLInputElement>(null);
+  const pendingDirectResumeRef = useRef<number>(0);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const delayNodeRef = useRef<DelayNode | null>(null);
+  const mediaSourceConnectedRef = useRef<boolean>(false);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [rawVideoTime, setRawVideoTime] = useState(0);
   const [rawVideoDuration, setRawVideoDuration] = useState(0);
   const [probedDuration, setProbedDuration] = useState(0);
+  const [transcodeRequestStart, setTranscodeRequestStart] = useState(0);
   const [transcodeOffset, setTranscodeOffset] = useState(0);
   const [bufferedEnd, setBufferedEnd] = useState(0);
 
@@ -210,8 +251,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         !window.location.hostname.endsWith('.run.app')));
   const [decoderMode, setDecoderMode] = useState<DecoderMode>('direct');
   const [transcodeAvailable, setTranscodeAvailable] = useState<boolean | null>(
-    () => (isRemoteTranscodeHost ? false : null),
+    null,
   );
+  const [isProbePending, setIsProbePending] = useState<boolean>(false);
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() =>
     isRemoteTranscodeHost ? remoteBackendBase : '',
   );
@@ -244,6 +286,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(() =>
     settingsStorage.getPlaybackSpeed(),
   );
+  const playbackSpeedRef = useRef<number>(playbackSpeed);
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed;
+  }, [playbackSpeed]);
+
   const [resizeMode, setResizeMode] = useState<PlayerResizeMode>(() =>
     settingsStorage.getDefaultResizeMode(),
   );
@@ -251,6 +298,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Audio & Subtitle Delay (ms)
   const [audioDelayMs, setAudioDelayMs] = useState(0);
   const [subtitleDelayMs, setSubtitleDelayMs] = useState(0);
+  const [baseVttText, setBaseVttText] = useState<string | null>(null);
 
   // Unified Vega Settings Sheet & Episode Drawer
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -353,6 +401,42 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     return 0;
   }, [probedDuration, rawVideoDuration, isUsingTranscodeEngine, transcodeOffset]);
 
+  // Fast-check backend FFmpeg capability on mount so MKV/incompatible streams never false-start in Direct mode
+  useEffect(() => {
+    let cancelled = false;
+    const candidates = isRemoteTranscodeHost
+      ? remoteBackendBase
+        ? [remoteBackendBase]
+        : []
+      : remoteBackendBase
+        ? ['', remoteBackendBase]
+        : [''];
+    (async () => {
+      for (const base of candidates) {
+        try {
+          const r = await fetch(`${base}/api/health`);
+          if (r.ok) {
+            const info = await r.json();
+            if (cancelled) return;
+            if (info?.ffmpegAvailable !== false) {
+              setApiBaseUrl(base);
+              setTranscodeAvailable(true);
+              return;
+            }
+          }
+        } catch {
+          // Try next backend candidate
+        }
+      }
+      if (!cancelled) {
+        setTranscodeAvailable(prev => (prev === null ? false : prev));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isRemoteTranscodeHost, remoteBackendBase]);
+
   // Reset per-stream state and probe stream metadata via ffprobe
   useEffect(() => {
     const rawLink = selectedStream?.link?.trim() || '';
@@ -369,6 +453,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     setVideoDimensions(null);
     setSelectedAudioTrackId(0);
     setSelectedSubtitleId('off');
+    setBaseVttText(null);
     setActiveVttBlobUrl(null);
     setUseRemoteProxyFallback(isRemoteTranscodeHost);
     setUseRawUrlFallback(false);
@@ -391,18 +476,25 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       !isLocalBlob
         ? 'hw'
         : 'direct';
+    const initialResumeFloor = savedResumePos > 5 ? Math.floor(savedResumePos) : 0;
     setDecoderMode(initialMode);
-    setTranscodeOffset(
-      initialMode !== 'direct' && savedResumePos > 5
-        ? Math.floor(savedResumePos)
-        : 0,
-    );
+    setTranscodeRequestStart(initialMode !== 'direct' ? initialResumeFloor : 0);
+    setTranscodeOffset(initialMode !== 'direct' ? initialResumeFloor : 0);
 
     if (!rawLink || rawLink.startsWith('blob:') || isHlsStream || isDashStream) {
+      setIsProbePending(false);
       return;
     }
 
     let cancelled = false;
+    // Defer initial <video.src> attachment on MKV / pending-health streams briefly so we don't
+    // false-start raw MKV over stream-proxy only to restart mid-playback once probe finishes.
+    if (isMkvContainer && transcodeAvailable !== false) {
+      setIsProbePending(true);
+    } else {
+      setIsProbePending(false);
+    }
+
     const params = new URLSearchParams({url: rawLink});
     if (encodedStreamHeaders) {
       params.set('headers', encodedStreamHeaders);
@@ -500,14 +592,32 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         const isHevc = /hevc|h265|vp9|av1/i.test(String(info.videoCodec || ''));
         const isMkvFormat = String(info.formatName || '').includes('matroska');
         if (hasIncompatibleAudio || isHevc || isMkvFormat) {
-          setDecoderMode(prev => (prev === 'direct' ? (isHevc ? 'sw' : 'hw') : prev));
+          const targetMode: DecoderMode = isHevc ? 'sw' : 'hw';
+          setDecoderMode(prev => {
+            if (prev === 'direct') {
+              const curPos =
+                initialResumeFloor > 5
+                  ? initialResumeFloor
+                  : Math.floor(videoRef.current?.currentTime || 0);
+              setTranscodeRequestStart(curPos);
+              setTranscodeOffset(curPos);
+              return targetMode;
+            }
+            if (isHevc && prev === 'hw') {
+              return 'sw';
+            }
+            return prev;
+          });
         }
+        setIsProbePending(false);
       })
       .catch(() => {
         if (cancelled) return;
         setTranscodeAvailable(false);
         setDecoderMode('direct');
+        setTranscodeRequestStart(0);
         setTranscodeOffset(0);
+        setIsProbePending(false);
       });
 
     return () => {
@@ -524,6 +634,62 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     isLocalBlob,
     isRemoteTranscodeHost,
     remoteBackendBase,
+  ]);
+
+  // Refine transcodeOffset & subtitle start offset to the actual keyframe FFmpeg starts on when seeking in HW (-c:v copy) mode
+  useEffect(() => {
+    if (
+      !isUsingTranscodeEngine ||
+      decoderMode === 'sw' ||
+      transcodeRequestStart <= 0 ||
+      !selectedStream?.link ||
+      isLocalBlob
+    ) {
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    const transcodeBase =
+      apiBaseUrl || (isRemoteTranscodeHost ? remoteBackendBase : '');
+    const kfParams = new URLSearchParams({
+      url: selectedStream.link.trim(),
+      start: String(transcodeRequestStart),
+    });
+    if (encodedStreamHeaders) {
+      kfParams.set('headers', encodedStreamHeaders);
+    }
+    fetch(`${transcodeBase}/api/resolve-keyframe?${kfParams.toString()}`, {
+      signal: controller.signal,
+    })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (
+          data &&
+          typeof data.keyframeSec === 'number' &&
+          Number.isFinite(data.keyframeSec) &&
+          data.keyframeSec >= 0 &&
+          Math.abs(data.keyframeSec - transcodeRequestStart) < 25
+        ) {
+          setTranscodeOffset(data.keyframeSec);
+        }
+      })
+      .catch(() => {})
+      .finally(() => clearTimeout(timer));
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    isUsingTranscodeEngine,
+    decoderMode,
+    transcodeRequestStart,
+    selectedStream?.link,
+    isLocalBlob,
+    apiBaseUrl,
+    isRemoteTranscodeHost,
+    remoteBackendBase,
+    encodedStreamHeaders,
   ]);
 
   const audioTracks = useMemo<AudioTrackItem[]>(() => {
@@ -550,7 +716,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   // Build resolved playback URL
   const resolvedVideoUrl = useMemo(() => {
     const rawLink = selectedStream?.link?.trim() || '';
-    if (!rawLink) return '';
+    if (!rawLink || isProbePending) return '';
     if (rawLink.startsWith('blob:') || rawLink.startsWith('/api/')) {
       return rawLink;
     }
@@ -589,7 +755,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       apiBaseUrl || (isRemoteTranscodeHost ? remoteBackendBase : '');
     const params = new URLSearchParams({
       url: rawLink,
-      start: String(Math.floor(transcodeOffset)),
+      start: String(Math.floor(transcodeRequestStart)),
       audio: String(selectedAudioTrackId),
       mode: decoderMode === 'sw' ? 'sw' : 'auto',
     });
@@ -599,6 +765,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     return `${transcodeBase}/api/transcode-stream?${params.toString()}`;
   }, [
     selectedStream?.link,
+    isProbePending,
     isHlsStream,
     isDashStream,
     decoderMode,
@@ -608,10 +775,21 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     remoteBackendBase,
     isRemoteTranscodeHost,
     useRawUrlFallback,
-    transcodeOffset,
+    transcodeRequestStart,
     selectedAudioTrackId,
     encodedStreamHeaders,
   ]);
+
+  const isCorsSafeVideoSource = useMemo(() => {
+    if (!resolvedVideoUrl) return false;
+    if (resolvedVideoUrl.startsWith('/') || resolvedVideoUrl.startsWith('blob:')) {
+      return true;
+    }
+    if (remoteBackendBase && resolvedVideoUrl.startsWith(remoteBackendBase)) {
+      return true;
+    }
+    return false;
+  }, [resolvedVideoUrl, remoteBackendBase]);
 
   // Attach HLS.js, DASH.js, or HTML5 Video source
   useEffect(() => {
@@ -629,6 +807,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
 
     setPlaybackError(null);
     setIsBuffering(true);
+    pendingDirectResumeRef.current = 0;
 
     const savedResumePos =
       activeEpisode?.link
@@ -636,8 +815,24 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         : 0;
 
     if (isDashStream) {
+      video.removeAttribute('src');
       const player = dashjs.MediaPlayer().create();
       dashRef.current = player;
+
+      player.updateSettings({
+        streaming: {
+          enableManifestTimescaleMismatchFix: true,
+          buffer: {
+            fastSwitchEnabled: true,
+            flushBufferAtTrackSwitch: true,
+            enableSeekDecorrelationFix: true,
+          },
+          gaps: {
+            jumpGaps: true,
+            jumpLargeGaps: true,
+          },
+        },
+      });
 
       player.addRequestInterceptor(async request => {
         if (
@@ -700,10 +895,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           setSelectedAudioTrackId(curIdx >= 0 ? curIdx : 0);
         }
 
-        if (savedResumePos > 5) {
-          video.currentTime = savedResumePos;
-        }
-        video.playbackRate = playbackSpeed;
+        video.playbackRate = playbackSpeedRef.current;
         video.play().catch(() => {});
       });
 
@@ -721,11 +913,23 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         }
       });
 
-      player.initialize(video, resolvedVideoUrl, true);
+      player.initialize(
+        video,
+        resolvedVideoUrl,
+        true,
+        savedResumePos > 5 ? savedResumePos : undefined,
+      );
     } else if (isHlsStream && Hls.isSupported()) {
+      video.removeAttribute('src');
       const hls = new Hls({
         enableWorker: true,
         backBufferLength: 60,
+        startPosition: savedResumePos > 5 ? savedResumePos : -1,
+        lowLatencyMode: false,
+        stretchShortVideoTrack: false,
+        maxAudioFramesDrift: 1,
+        forceKeyFrameOnDiscontinuity: true,
+        nudgeOnVideoHole: true,
         xhrSetup: (xhr, reqUrl) => {
           if (
             reqUrl &&
@@ -786,11 +990,20 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           setSelectedAudioTrackId(hls.audioTrack >= 0 ? hls.audioTrack : 0);
         }
 
-        if (savedResumePos > 5) {
-          video.currentTime = savedResumePos;
-        }
-        video.playbackRate = playbackSpeed;
+        video.playbackRate = playbackSpeedRef.current;
         video.play().catch(() => {});
+      });
+
+      hls.on(Hls.Events.LEVEL_SWITCHED, () => {
+        if (videoRef.current) {
+          videoRef.current.playbackRate = playbackSpeedRef.current;
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, () => {
+        if (videoRef.current) {
+          videoRef.current.playbackRate = playbackSpeedRef.current;
+        }
       });
 
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_event, data) => {
@@ -827,18 +1040,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       setSelectedQualityId(-1);
       setHlsAudioTracks([]);
 
+      pendingDirectResumeRef.current =
+        !isUsingTranscodeEngine && savedResumePos > 5 ? savedResumePos : 0;
       video.src = resolvedVideoUrl;
-      video.onloadedmetadata = () => {
-        if (
-          !isUsingTranscodeEngine &&
-          savedResumePos > 5 &&
-          savedResumePos < (video.duration || Infinity) - 10
-        ) {
-          video.currentTime = savedResumePos;
-        }
-        video.playbackRate = playbackSpeed;
-        video.play().catch(() => {});
-      };
+      video.playbackRate = playbackSpeedRef.current;
     }
 
     return () => {
@@ -853,19 +1058,62 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     };
   }, [resolvedVideoUrl, streamSelectionRevision]);
 
-  // Load and convert selected subtitle into WebVTT blob URL
+  // Wire Web Audio DelayNode lazily when user sets manual audioDelayMs > 0 on CORS-safe streams
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (delayNodeRef.current && audioCtxRef.current) {
+      const sec = Math.max(0, Math.min(5, audioDelayMs / 1000));
+      delayNodeRef.current.delayTime.setValueAtTime(
+        sec,
+        audioCtxRef.current.currentTime,
+      );
+      if (sec > 0 && audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      return;
+    }
+
+    if (audioDelayMs <= 0 || !isCorsSafeVideoSource || mediaSourceConnectedRef.current) {
+      return;
+    }
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx: AudioContext = audioCtxRef.current || new AudioCtx();
+      const source = ctx.createMediaElementSource(video);
+      const delay = ctx.createDelay(5.0);
+      delay.delayTime.setValueAtTime(
+        Math.max(0, Math.min(5, audioDelayMs / 1000)),
+        ctx.currentTime,
+      );
+      source.connect(delay);
+      delay.connect(ctx.destination);
+      audioCtxRef.current = ctx;
+      delayNodeRef.current = delay;
+      mediaSourceConnectedRef.current = true;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+    } catch {
+      // Browser blocked MediaElementAudioSource; leave audio un-routed
+    }
+  }, [audioDelayMs, isCorsSafeVideoSource]);
+
+  // Load and convert selected subtitle into base WebVTT text
   useEffect(() => {
     let active = true;
-    let createdBlob: string | null = null;
 
     async function loadSub() {
       if (selectedSubtitleId === 'off') {
-        setActiveVttBlobUrl(null);
+        setBaseVttText(null);
         return;
       }
       const track = subtitleTracks.find(t => t.id === selectedSubtitleId);
       if (!track?.uri) {
-        setActiveVttBlobUrl(null);
+        setBaseVttText(null);
         return;
       }
 
@@ -877,7 +1125,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
         } else if (track.uri.includes('/api/subtitle-extract')) {
           let extractUrl = track.uri;
           if (isUsingTranscodeEngine && transcodeOffset > 0) {
-            extractUrl = `${extractUrl}&start=${Math.floor(transcodeOffset)}`;
+            extractUrl = `${extractUrl}&start=${transcodeOffset.toFixed(3)}`;
           }
           const res = await fetch(extractUrl);
           subText = await res.text();
@@ -932,22 +1180,22 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
             }
           }
         }
-        if (!active || !subText) return;
+        if (!active || !subText) {
+          if (active) setBaseVttText(null);
+          return;
+        }
         const vtt = subText.trimStart().startsWith('WEBVTT')
           ? subText
           : convertSrtToVtt(subText);
-        const blob = new Blob([vtt], {type: 'text/vtt'});
-        createdBlob = URL.createObjectURL(blob);
-        setActiveVttBlobUrl(createdBlob);
+        setBaseVttText(vtt);
       } catch {
-        if (active) setActiveVttBlobUrl(null);
+        if (active) setBaseVttText(null);
       }
     }
 
     loadSub();
     return () => {
       active = false;
-      if (createdBlob) URL.revokeObjectURL(createdBlob);
     };
   }, [
     selectedSubtitleId,
@@ -956,6 +1204,21 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     transcodeOffset,
     encodedStreamHeaders,
   ]);
+
+  // Apply subtitleDelayMs cleanly without re-fetching subtitle source
+  useEffect(() => {
+    if (!baseVttText) {
+      setActiveVttBlobUrl(null);
+      return;
+    }
+    const shifted = shiftVttTimestamps(baseVttText, subtitleDelayMs);
+    const blob = new Blob([shifted], {type: 'text/vtt'});
+    const url = URL.createObjectURL(blob);
+    setActiveVttBlobUrl(url);
+    return () => {
+      URL.revokeObjectURL(url);
+    };
+  }, [baseVttText, subtitleDelayMs]);
 
   // Auto-hide controls after 3.5s of inactivity
   useEffect(() => {
@@ -1023,9 +1286,11 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           video.currentTime = relTarget;
           setRawVideoTime(relTarget);
         } else {
+          const reqStart = Math.floor(clamped);
           setIsBuffering(true);
           setRawVideoTime(0);
-          setTranscodeOffset(Math.floor(clamped));
+          setTranscodeRequestStart(reqStart);
+          setTranscodeOffset(reqStart);
         }
       } else {
         video.currentTime = clamped;
@@ -1061,8 +1326,10 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     const order: DecoderMode[] = ['hw', 'sw', 'direct'];
     const next = order[(order.indexOf(decoderMode) + 1) % order.length];
     if (next === 'direct') {
+      setTranscodeRequestStart(0);
       setTranscodeOffset(0);
     } else {
+      setTranscodeRequestStart(savedPos);
       setTranscodeOffset(savedPos);
     }
     setDecoderMode(next);
@@ -1132,6 +1399,8 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       if (decoderMode === 'direct') {
         setDecoderMode('hw');
       }
+      setRawVideoTime(0);
+      setTranscodeRequestStart(savedPos);
       setTranscodeOffset(savedPos);
     }
     showToast(`Audio: ${track.label}`);
@@ -1141,6 +1410,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
   const handleChangeSpeed = (speed: number) => {
     const rounded = Math.max(0.25, Math.min(2.0, Math.round(speed * 20) / 20));
     setPlaybackSpeed(rounded);
+    playbackSpeedRef.current = rounded;
     settingsStorage.setPlaybackSpeed(rounded);
     if (videoRef.current) {
       videoRef.current.playbackRate = rounded;
@@ -1179,6 +1449,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
     if (!file) return;
     const blobUrl = URL.createObjectURL(file);
     setDecoderMode('direct');
+    setTranscodeRequestStart(0);
     setTranscodeOffset(0);
     setSelectedStream({
       server: `Local: ${file.name}`,
@@ -1329,6 +1600,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
       {/* HTML5 Video Element */}
       <video
         ref={videoRef}
+        crossOrigin={isCorsSafeVideoSource ? 'anonymous' : undefined}
         className={videoFitClass}
         playsInline
         onLoadedMetadata={e => {
@@ -1336,13 +1608,33 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
           if (v.videoWidth > 0 && v.videoHeight > 0) {
             setVideoDimensions({width: v.videoWidth, height: v.videoHeight});
           }
+          if (!isHlsStream && !isDashStream) {
+            const resumeTarget = pendingDirectResumeRef.current;
+            pendingDirectResumeRef.current = 0;
+            if (
+              !isUsingTranscodeEngine &&
+              resumeTarget > 5 &&
+              resumeTarget < (v.duration || Infinity) - 10
+            ) {
+              v.currentTime = resumeTarget;
+            }
+            v.playbackRate = playbackSpeedRef.current;
+            v.play().catch(() => {});
+          }
         }}
-        onPlay={() => setIsPlaying(true)}
+        onPlay={e => {
+          setIsPlaying(true);
+          e.currentTarget.playbackRate = playbackSpeedRef.current;
+          if (audioCtxRef.current?.state === 'suspended') {
+            audioCtxRef.current.resume().catch(() => {});
+          }
+        }}
         onPause={() => setIsPlaying(false)}
         onWaiting={() => setIsBuffering(true)}
-        onPlaying={() => {
+        onPlaying={e => {
           setIsBuffering(false);
           setPlaybackError(null);
+          e.currentTarget.playbackRate = playbackSpeedRef.current;
         }}
         onCanPlay={() => setIsBuffering(false)}
         onTimeUpdate={e => {
@@ -1421,7 +1713,9 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
               !tried.has('hw')
             ) {
               tried.add('hw');
-              setTranscodeOffset(Math.floor(currentTime));
+              const pos = Math.floor(currentTime);
+              setTranscodeRequestStart(pos);
+              setTranscodeOffset(pos);
               setDecoderMode('hw');
               showToast('Switching to HW Remux Decoder...');
               return;
@@ -1435,13 +1729,16 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
               !tried.has('sw')
             ) {
               tried.add('sw');
-              setTranscodeOffset(Math.floor(currentTime));
+              const pos = Math.floor(currentTime);
+              setTranscodeRequestStart(pos);
+              setTranscodeOffset(pos);
               setDecoderMode('sw');
               showToast('Switching to SW H.264 Decoder...');
               return;
             }
             if (decoderMode !== 'direct' && !tried.has('direct-reset')) {
               tried.add('direct-reset');
+              setTranscodeRequestStart(0);
               setTranscodeOffset(0);
               setDecoderMode('direct');
               setUseRemoteProxyFallback(true);
@@ -2331,14 +2628,12 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                       <p className="text-[11px] text-white/60">
                         {audioDelayMs === 0
                           ? '0 ms (In sync)'
-                          : audioDelayMs > 0
-                            ? `+${audioDelayMs} ms (Sound plays later)`
-                            : `${audioDelayMs} ms (Sound plays earlier)`}
+                          : `+${audioDelayMs} ms (Sound plays later)`}
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => setAudioDelayMs(d => d - 50)}
+                        onClick={() => setAudioDelayMs(d => Math.max(0, d - 50))}
                         className="w-8 h-8 rounded-full bg-[#303030] hover:bg-[#3d3d3d] text-white flex items-center justify-center cursor-pointer">
                         <Minus size={15} />
                       </button>
@@ -2348,7 +2643,7 @@ export const Player: React.FC<{routeParams: PlayerRouteParams}> = ({
                         Reset
                       </button>
                       <button
-                        onClick={() => setAudioDelayMs(d => d + 50)}
+                        onClick={() => setAudioDelayMs(d => Math.min(5000, d + 50))}
                         className="w-8 h-8 rounded-full bg-[#303030] hover:bg-[#3d3d3d] text-white flex items-center justify-center cursor-pointer">
                         <Plus size={15} />
                       </button>

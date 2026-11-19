@@ -1767,6 +1767,59 @@ function startBackend() {
     });
   });
 
+  app.get('/api/resolve-keyframe', async (req, res) => {
+    try {
+      const targetUrl = String(req.query.url || '').trim();
+      const encodedHeaders = String(req.query.headers || '').trim();
+      const targetSec = Math.max(0, parseFloat(String(req.query.start || '0')) || 0);
+      if (!targetUrl || !FFPROBE_AVAILABLE || targetSec <= 0) {
+        res.json({keyframeSec: targetSec});
+        return;
+      }
+      const customHeaders = parseEncodedHeaders(encodedHeaders);
+      const useLoopback = isKnownH2OrCdnHost(targetUrl);
+      const inputUrl = useLoopback
+        ? buildLoopbackStreamUrl(targetUrl, customHeaders)
+        : targetUrl;
+      const headerStr = useLoopback ? '' : buildFfmpegHeadersArg(customHeaders);
+      const winStart = Math.max(0, targetSec - 20);
+      const winEnd = targetSec + 0.5;
+      const args = [
+        '-v',
+        'quiet',
+        '-rw_timeout',
+        '3000000',
+        '-read_intervals',
+        `${winStart}%${winEnd}`,
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'packet=pts_time,flags',
+        '-of',
+        'csv=p=0',
+      ];
+      if (headerStr) {
+        args.push('-headers', headerStr);
+      }
+      args.push(inputUrl);
+      const {stdout} = await execFileAsync('ffprobe', args, {
+        timeout: 3500,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      const kfs = String(stdout || '')
+        .split('\n')
+        .map(line => line.trim().split(','))
+        .filter(([pts, flags]) => flags && flags.includes('K') && pts && Number.isFinite(Number(pts)))
+        .map(([pts]) => Number(pts))
+        .filter(pts => pts <= targetSec + 0.05)
+        .sort((a, b) => b - a);
+      res.json({keyframeSec: kfs.length > 0 ? kfs[0] : targetSec});
+    } catch {
+      const targetSec = Math.max(0, parseFloat(String(req.query.start || '0')) || 0);
+      res.json({keyframeSec: targetSec});
+    }
+  });
+
   app.get('/api/transcode-stream', async (req, res) => {
     const targetUrl = String(req.query.url || '').trim();
     const encodedHeaders = String(req.query.headers || '').trim();
@@ -1793,46 +1846,65 @@ function startBackend() {
       : targetUrl;
     const headerStr = useLoopback ? '' : buildFfmpegHeadersArg(customHeaders);
 
+    let useSoftwareVideoTranscode =
+      requestedMode === 'sw' || requestedMode === 'transcode';
     let videoCodec = '';
-    try {
-      const probed = await probeRemoteStream(targetUrl, customHeaders);
-      videoCodec = probed.videoCodec;
-      if (probed.duration > 0) {
-        res.setHeader('X-Video-Duration', String(probed.duration));
+    if (requestedMode === 'auto') {
+      try {
+        const probed = await probeRemoteStream(targetUrl, customHeaders);
+        videoCodec = probed.videoCodec;
+        if (probed.duration > 0) {
+          res.setHeader('X-Video-Duration', String(probed.duration));
+        }
+        if (videoCodec) {
+          res.setHeader('X-Video-Codec', videoCodec);
+        }
+        if (
+          videoCodec &&
+          videoCodec !== 'h264' &&
+          videoCodec !== 'avc1'
+        ) {
+          useSoftwareVideoTranscode = true;
+        }
+      } catch {
+        // Proceed cleanly even if quick probe fails
       }
-      if (videoCodec) {
-        res.setHeader('X-Video-Codec', videoCodec);
-      }
-    } catch {
-      // Proceed cleanly even if quick probe fails
     }
 
-    const needsVideoTranscode =
-      requestedMode === 'sw' ||
-      (requestedMode !== 'hw' &&
-        videoCodec !== '' &&
-        !['h264', 'avc1', 'vp8', 'vp9'].includes(videoCodec));
-
-    const args = ['-v', 'error', '-reconnect', '1', '-reconnect_streamed', '1'];
+    const args = [
+      '-v',
+      'error',
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_delay_max',
+      '5',
+    ];
     if (headerStr) {
       args.push('-headers', headerStr);
     }
     if (startSec > 0) {
+      if (!useSoftwareVideoTranscode) {
+        args.push('-noaccurate_seek');
+      }
       args.push('-ss', String(startSec));
     }
     args.push('-i', inputUrl);
-    args.push('-map', '0:v:0', '-map', `0:a:${audioIndex}?`);
+    args.push('-map', '0:v:0', '-map', `0:a:${audioIndex}?`, '-sn', '-dn');
 
-    if (needsVideoTranscode) {
+    if (useSoftwareVideoTranscode) {
       args.push(
+        '-vf',
+        "scale='min(1920,iw)':-2,format=yuv420p",
         '-c:v',
         'libx264',
         '-preset',
-        'veryfast',
+        'ultrafast',
+        '-tune',
+        'zerolatency',
         '-crf',
-        '23',
-        '-pix_fmt',
-        'yuv420p',
+        '24',
         '-maxrate',
         '6M',
         '-bufsize',
@@ -1840,9 +1912,14 @@ function startBackend() {
       );
     } else {
       args.push('-c:v', 'copy');
+      if (startSec > 0) {
+        args.push('-avoid_negative_ts', 'make_zero');
+      }
     }
 
     args.push(
+      '-af',
+      'aresample=async=1:min_hard_comp=0.100',
       '-c:a',
       'aac',
       '-ac',
@@ -1850,7 +1927,7 @@ function startBackend() {
       '-b:a',
       '192k',
       '-movflags',
-      'frag_keyframe+empty_moov+default_base_moof+faststart',
+      'frag_keyframe+delay_moov+default_base_moof',
       '-f',
       'mp4',
       'pipe:1',

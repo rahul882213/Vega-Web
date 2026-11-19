@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import fs from 'fs';
-import {spawn, execFile} from 'child_process';
+import {spawn, execFile, execFileSync} from 'child_process';
 import {promisify} from 'util';
 import express from 'express';
 import path from 'path';
@@ -13,6 +13,18 @@ import {SocksProxyAgent} from 'socks-proxy-agent';
 
 const SERVER_PORT = Number(process.env.PORT || 3000);
 const execFileAsync = promisify(execFile);
+
+function checkBinaryAvailable(bin: string, flag = '-version'): boolean {
+  try {
+    execFileSync(bin, [flag], {stdio: 'ignore', timeout: 3000});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const FFMPEG_AVAILABLE = checkBinaryAvailable('ffmpeg', '-version');
+const FFPROBE_AVAILABLE = checkBinaryAvailable('ffprobe', '-version');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -599,6 +611,8 @@ async function startServer() {
       ok: true,
       status: 'healthy',
       service: 'vega-web-server',
+      ffmpegAvailable: FFMPEG_AVAILABLE,
+      ffprobeAvailable: FFPROBE_AVAILABLE,
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
     });
@@ -1351,6 +1365,60 @@ async function startServer() {
     });
   });
 
+  // Resolve the nearest video keyframe <= requested seek timestamp so HW (-c:v copy) seek offsets & subtitles stay aligned
+  app.get('/api/resolve-keyframe', async (req, res) => {
+    try {
+      const targetUrl = String(req.query.url || '').trim();
+      const encodedHeaders = String(req.query.headers || '').trim();
+      const targetSec = Math.max(0, parseFloat(String(req.query.start || '0')) || 0);
+      if (!targetUrl || !FFPROBE_AVAILABLE || targetSec <= 0) {
+        res.json({keyframeSec: targetSec});
+        return;
+      }
+      const customHeaders = parseEncodedHeaders(encodedHeaders);
+      const useLoopback = isKnownH2OrCdnHost(targetUrl);
+      const inputUrl = useLoopback
+        ? buildLoopbackStreamUrl(targetUrl, customHeaders)
+        : targetUrl;
+      const headerStr = useLoopback ? '' : buildFfmpegHeadersArg(customHeaders);
+      const winStart = Math.max(0, targetSec - 20);
+      const winEnd = targetSec + 0.5;
+      const args: string[] = [
+        '-v',
+        'quiet',
+        '-rw_timeout',
+        '3000000',
+        '-read_intervals',
+        `${winStart}%${winEnd}`,
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'packet=pts_time,flags',
+        '-of',
+        'csv=p=0',
+      ];
+      if (headerStr) {
+        args.push('-headers', headerStr);
+      }
+      args.push(inputUrl);
+      const {stdout} = await execFileAsync('ffprobe', args, {
+        timeout: 3500,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      const kfs = String(stdout || '')
+        .split('\n')
+        .map(line => line.trim().split(','))
+        .filter(([pts, flags]) => flags && flags.includes('K') && pts && Number.isFinite(Number(pts)))
+        .map(([pts]) => Number(pts))
+        .filter(pts => pts <= targetSec + 0.05)
+        .sort((a, b) => b - a);
+      res.json({keyframeSec: kfs.length > 0 ? kfs[0] : targetSec});
+    } catch {
+      const targetSec = Math.max(0, parseFloat(String(req.query.start || '0')) || 0);
+      res.json({keyframeSec: targetSec});
+    }
+  });
+
   // Live FFmpeg Remux / Transcode Stream Endpoint for Browser Compatibility (MKV, EAC3, AC3, HEVC, Dual-Audio)
   app.get('/api/transcode-stream', async (req, res) => {
     const targetUrl = String(req.query.url || '').trim();
@@ -1373,13 +1441,21 @@ async function startServer() {
 
     // Determine whether we can copy video (-c:v copy) or need H.264 software transcoding
     let useSoftwareVideoTranscode = requestedMode === 'sw' || requestedMode === 'transcode';
+    let videoCodec = '';
     if (requestedMode === 'auto') {
       try {
         const info = await probeRemoteStream(targetUrl, customHeaders);
+        videoCodec = info.videoCodec;
+        if (info.duration > 0) {
+          res.setHeader('X-Video-Duration', String(info.duration));
+        }
+        if (videoCodec) {
+          res.setHeader('X-Video-Codec', videoCodec);
+        }
         if (
-          info.videoCodec &&
-          info.videoCodec !== 'h264' &&
-          info.videoCodec !== 'avc1'
+          videoCodec &&
+          videoCodec !== 'h264' &&
+          videoCodec !== 'avc1'
         ) {
           // HEVC / 10-bit / MPEG4 etc. -> transcode to H.264 so all browsers play it smoothly
           useSoftwareVideoTranscode = true;
@@ -1405,6 +1481,11 @@ async function startServer() {
     }
 
     if (startSec > 0) {
+      if (!useSoftwareVideoTranscode) {
+        // Seek audio and video together to nearest keyframe when copying video (-c:v copy),
+        // preventing audio from jumping up to an entire GOP ahead of video.
+        args.push('-noaccurate_seek');
+      }
       args.push('-ss', String(startSec));
     }
 
@@ -1432,10 +1513,16 @@ async function startServer() {
       );
     } else {
       args.push('-c:v', 'copy');
+      if (startSec > 0) {
+        args.push('-avoid_negative_ts', 'make_zero');
+      }
     }
 
-    // Always convert audio to browser-native 2-channel AAC so EAC3/AC3/DTS/5.1 MKVs have crystal-clear sound
+    // Use delay_moov (instead of empty_moov) so MP4 edit lists (elst) preserve exact
+    // B-frame composition timing and AAC 1024-sample priming compensation (0ms AV offset).
     args.push(
+      '-af',
+      'aresample=async=1:min_hard_comp=0.100',
       '-c:a',
       'aac',
       '-ac',
@@ -1443,7 +1530,7 @@ async function startServer() {
       '-b:a',
       '192k',
       '-movflags',
-      'frag_keyframe+empty_moov+default_base_moof+faststart',
+      'frag_keyframe+delay_moov+default_base_moof',
       '-f',
       'mp4',
       'pipe:1',
